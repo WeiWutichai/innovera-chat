@@ -26,6 +26,23 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // Produces .next/standalone with a minimal server.js and only the traced subset of
+  // node_modules, so the runtime image carries no devDependencies and no Prisma CLI.
+  // Note: standalone does NOT copy `public` or `.next/static` — the Dockerfile copies
+  // both explicitly, or the app boots and serves unstyled pages.
+  output: "standalone",
+
+  // Next's file tracer can miss native assets. Prisma's query engine is exactly that
+  // class: a musl-linked .node binary plus the generated client, loaded at runtime
+  // through paths the tracer cannot follow statically. Without this the runner starts
+  // and then fails on the first database call.
+  outputFileTracingIncludes: {
+    "/api/**/*": [
+      "./node_modules/.prisma/client/**/*",
+      "./node_modules/@prisma/client/**/*",
+    ],
+  },
+
   // Stop advertising the framework and its version.
   poweredByHeader: false,
 

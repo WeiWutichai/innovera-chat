@@ -9,6 +9,7 @@ import {
 } from "@/lib/rate-limiter";
 import { checkDailyQuota } from "@/lib/usage-quota";
 import { selectContextWithinBudget } from "@/lib/context-window";
+import { logInfo, logWarn, logError } from "@/lib/log";
 
 const chatRequestSchema = z.object({
   message: z.string().trim().min(1).max(chatConfig.maxMessageLength),
@@ -128,6 +129,12 @@ export async function POST(req: Request) {
     const rate = checkRateLimit(appUser.id, chatConfig.rateLimitPerMinute);
 
     if (!rate.allowed) {
+      logWarn("chat.rate_limited", {
+        correlationId,
+        userId: appUser.id,
+        retryAfterSeconds: rate.retryAfterSeconds,
+      });
+
       return Response.json(
         { error: RATE_LIMITED, reason: "rate_limited", correlationId },
         { status: 429, headers: { "Retry-After": String(rate.retryAfterSeconds) } }
@@ -164,6 +171,12 @@ export async function POST(req: Request) {
     // Acquired BEFORE the quota read. This is what bounds quota overshoot: at most
     // `maxConcurrentPerUser` requests can be racing the check at any instant.
     if (!acquireSlot(appUser.id, chatConfig.maxConcurrentPerUser)) {
+      logWarn("chat.concurrency_rejected", {
+        correlationId,
+        userId: appUser.id,
+        limit: chatConfig.maxConcurrentPerUser,
+      });
+
       return Response.json(
         { error: TOO_MANY_IN_FLIGHT, reason: "concurrency_limit", correlationId },
         { status: 429 }
@@ -175,6 +188,13 @@ export async function POST(req: Request) {
     const quota = await checkDailyQuota(appUser.id, appUser.dailyTokenLimit);
 
     if (!quota.withinQuota) {
+      logWarn("chat.quota_exceeded", {
+        correlationId,
+        userId: appUser.id,
+        usedToday: quota.used,
+        dailyTokenLimit: quota.limit,
+      });
+
       return Response.json(
         {
           error: QUOTA_EXCEEDED,
@@ -267,10 +287,7 @@ export async function POST(req: Request) {
 
         rolledBack = true;
       } catch {
-        console.error(
-          "chat.rollback_failed",
-          JSON.stringify({ correlationId, conversationId })
-        );
+        logError("chat.rollback_failed", { correlationId, conversationId });
       }
     };
 
@@ -288,10 +305,7 @@ export async function POST(req: Request) {
           },
         });
       } catch {
-        console.error(
-          "chat.usage_record_failed",
-          JSON.stringify({ correlationId })
-        );
+        logError("chat.usage_record_failed", { correlationId });
       }
     };
 
@@ -380,10 +394,7 @@ export async function POST(req: Request) {
         (error.name === "AbortError" || error.name === "TimeoutError");
 
       if (aborted && timeoutController.signal.aborted) {
-        console.error(
-          "chat.upstream_timeout",
-          JSON.stringify({ correlationId, timeoutMs: chatConfig.upstreamTimeoutMs })
-        );
+        logError("chat.upstream_timeout", { correlationId, timeoutMs: chatConfig.upstreamTimeoutMs });
         await rollbackTurn();
         return failure(504, UPSTREAM_TIMEOUT, "timeout");
       }
@@ -391,21 +402,15 @@ export async function POST(req: Request) {
       if (aborted && req.signal.aborted) {
         // The client stopped waiting. No usage was reported, so nothing is recorded —
         // see the known limitation documented in the Phase 2 notes.
-        console.warn(
-          "chat.client_cancelled",
-          JSON.stringify({ correlationId })
-        );
+        logWarn("chat.client_cancelled", { correlationId });
         await rollbackTurn();
         return failure(499, REQUEST_CANCELLED, "cancelled");
       }
 
-      console.error(
-        "chat.upstream_unreachable",
-        JSON.stringify({
+      logError("chat.upstream_unreachable", {
           correlationId,
           name: error instanceof Error ? error.name : "unknown",
-        })
-      );
+        });
       await rollbackTurn();
       return failure(502, UPSTREAM_UNAVAILABLE, "upstream");
     }
@@ -424,15 +429,12 @@ export async function POST(req: Request) {
         // Non-JSON upstream error body; the status alone is the signal.
       }
 
-      console.error(
-        "chat.upstream_error",
-        JSON.stringify({
+      logError("chat.upstream_error", {
           correlationId,
           status: response.status,
           type: upstreamType,
           code: upstreamCode,
-        })
-      );
+        });
 
       await rollbackTurn();
 
@@ -448,10 +450,7 @@ export async function POST(req: Request) {
     try {
       data = (await response.json()) as ChatCompletion;
     } catch {
-      console.error(
-        "chat.upstream_unparsable",
-        JSON.stringify({ correlationId, status: response.status })
-      );
+      logError("chat.upstream_unparsable", { correlationId, status: response.status });
 
       await rollbackTurn();
 
@@ -465,10 +464,7 @@ export async function POST(req: Request) {
     // A null or empty completion used to be stored verbatim as an assistant message and
     // then replayed into the model's own context on every following turn.
     if (!answer) {
-      console.error(
-        "chat.empty_completion",
-        JSON.stringify({ correlationId })
-      );
+      logError("chat.empty_completion", { correlationId });
 
       await rollbackTurn();
 
@@ -511,15 +507,12 @@ export async function POST(req: Request) {
     // The turn is committed; nothing after this point may undo it.
     rollbackTurn = null;
 
-    console.info(
-      "chat.completed",
-      JSON.stringify({
+    logInfo("chat.completed", {
         correlationId,
         contextMessages: aiMessages.length,
         contextChars: usedChars,
         totalTokens: usage.total_tokens ?? null,
-      })
-    );
+      });
 
     return Response.json({
       conversationId,
@@ -532,13 +525,10 @@ export async function POST(req: Request) {
       await rollbackTurn();
     }
 
-    console.error(
-      "chat.unhandled_error",
-      JSON.stringify({
+    logError("chat.unhandled_error", {
         correlationId,
         name: error instanceof Error ? error.name : "unknown",
-      })
-    );
+      });
 
     return Response.json(
       { error: "Internal server error", correlationId },

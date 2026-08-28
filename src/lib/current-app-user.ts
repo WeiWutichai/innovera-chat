@@ -1,6 +1,7 @@
 import { auth, currentUser } from "@clerk/nextjs/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { logWarn } from "@/lib/log";
 
 function isEmailUniqueViolation(error: unknown) {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError)) {
@@ -38,12 +39,7 @@ async function recoverFromEmailCollision(
       data: { name },
     });
 
-    console.warn(
-      JSON.stringify({
-        event: "user.email_conflict_skipped",
-        userId: preserved.id,
-      })
-    );
+    logWarn("user.email_conflict_skipped", { userId: preserved.id });
 
     return preserved;
   }
@@ -64,12 +60,7 @@ async function recoverFromEmailCollision(
     },
   });
 
-  console.warn(
-    JSON.stringify({
-      event: "user.email_relinked_pending_reapproval",
-      userId: relinked.id,
-    })
-  );
+  logWarn("user.email_relinked_pending_reapproval", { userId: relinked.id });
 
   return relinked;
 }

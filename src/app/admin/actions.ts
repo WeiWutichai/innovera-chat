@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { Prisma, type UserRole, type UserStatus } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { requireAdmin } from "@/lib/require-admin";
+import { logInfo } from "@/lib/log";
 
 const MAX_SERIALIZATION_RETRIES = 3;
 
@@ -105,7 +106,7 @@ async function updateWithoutRemovingLastActiveAdmin(
 }
 
 export async function approveUser(formData: FormData) {
-  await requireAdmin();
+  const admin = await requireAdmin();
 
   const id = readTargetId(formData);
 
@@ -113,6 +114,8 @@ export async function approveUser(formData: FormData) {
     where: { id },
     data: { status: "ACTIVE" },
   });
+
+  logInfo("admin.user_approved", { actorId: admin.id, targetId: id });
 
   revalidatePath("/admin");
 }
@@ -130,11 +133,13 @@ export async function disableUser(formData: FormData) {
     status: "DISABLED",
   });
 
+  logInfo("admin.user_disabled", { actorId: admin.id, targetId: id });
+
   revalidatePath("/admin");
 }
 
 export async function reactivateUser(formData: FormData) {
-  await requireAdmin();
+  const admin = await requireAdmin();
 
   const id = readTargetId(formData);
 
@@ -143,11 +148,13 @@ export async function reactivateUser(formData: FormData) {
     data: { status: "ACTIVE" },
   });
 
+  logInfo("admin.user_reactivated", { actorId: admin.id, targetId: id });
+
   revalidatePath("/admin");
 }
 
 export async function makeAdmin(formData: FormData) {
-  await requireAdmin();
+  const admin = await requireAdmin();
 
   const id = readTargetId(formData);
 
@@ -159,17 +166,21 @@ export async function makeAdmin(formData: FormData) {
     },
   });
 
+  logInfo("admin.admin_granted", { actorId: admin.id, targetId: id });
+
   revalidatePath("/admin");
 }
 
 export async function revokeAdmin(formData: FormData) {
-  await requireAdmin();
+  const admin = await requireAdmin();
 
   const id = readTargetId(formData);
 
   await updateWithoutRemovingLastActiveAdmin(id, {
     role: "USER",
   });
+
+  logInfo("admin.admin_revoked", { actorId: admin.id, targetId: id });
 
   revalidatePath("/admin");
 }

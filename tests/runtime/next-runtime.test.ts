@@ -95,6 +95,66 @@ describe("proxy behaviour at the real HTTP edge", () => {
   });
 });
 
+describe("security headers", () => {
+  // Headers only exist through the real server, so this is the only layer that can
+  // assert them. HSTS and CSP are deliberately absent — see next.config.ts.
+  it.each([
+    ["x-content-type-options", "nosniff"],
+    ["referrer-policy", "strict-origin-when-cross-origin"],
+    ["x-frame-options", "DENY"],
+  ])("sets %s", async (header, value) => {
+    const res = await fetch(url("/api/health/live"));
+    expect(res.headers.get(header)).toBe(value);
+  });
+
+  it("denies unused browser capabilities", async () => {
+    const res = await fetch(url("/api/health/live"));
+    const policy = res.headers.get("permissions-policy") ?? "";
+
+    expect(policy).toContain("camera=()");
+    expect(policy).toContain("microphone=()");
+    expect(policy).toContain("geolocation=()");
+  });
+
+  it("does not advertise the framework", async () => {
+    const res = await fetch(url("/api/health/live"));
+    expect(res.headers.get("x-powered-by")).toBeNull();
+  });
+
+  it("does NOT send HSTS — that is NGINX's responsibility", async () => {
+    const res = await fetch(url("/api/health/live"));
+    expect(res.headers.get("strict-transport-security")).toBeNull();
+  });
+
+  it("does NOT send a CSP in this phase", async () => {
+    // A second CSP from NGINX would be enforced as an intersection and break Clerk.
+    const res = await fetch(url("/api/health/live"));
+    expect(res.headers.get("content-security-policy")).toBeNull();
+  });
+
+  it("applies headers to page routes as well as API routes", async () => {
+    const res = await fetch(url("/"));
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+  });
+});
+
+describe("health endpoints through the real server", () => {
+  it("serves /api/health/live unauthenticated", async () => {
+    const res = await fetch(url("/api/health/live"));
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ok: true });
+  });
+
+  it("is not intercepted by the Clerk proxy", async () => {
+    const res = await fetch(url("/api/health/live"));
+    const text = await res.clone().text();
+
+    // An intercepted request would return Next's HTML 404, not JSON.
+    expect(text.trimStart().startsWith("<")).toBe(false);
+  });
+});
+
 describe("client disconnect", () => {
   it("does not abort while the client waits for a normal response", async () => {
     upstream.reset();

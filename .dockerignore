@@ -1,6 +1,78 @@
+# ---------------------------------------------------------------------------
+# Docker build context exclusions.
+#
+# Every dangerous pattern is written BOTH bare and with a leading **/ so the
+# exclusion holds regardless of matcher semantics. A bare ".env" excludes only
+# the root file under some matchers, which would happily copy src/.env into the
+# image; "**/.env" alone is ambiguous about the root. Listing both is free.
+#
+# NOTE: no "*.sql" pattern. It would risk excluding
+# prisma/migrations/*/migration.sql, which the migrator image requires. Database
+# dumps are covered by "backups" and "*.dump" instead. The explicit !prisma
+# negation at the end is a belt-and-braces guarantee for the migrator.
+# ---------------------------------------------------------------------------
+
+# dependencies and build output
 node_modules
+**/node_modules
 .next
-.git
+**/.next
+out
+build
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# environment files and secrets (both forms, deliberately)
 .env
 .env.*
-npm-debug.log
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+*.pem
+**/*.pem
+*.key
+**/*.key
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+*.crt
+**/*.crt
+id_rsa*
+**/id_rsa*
+
+# version control and CI
+.git
+.gitignore
+.github
+
+# tests and test tooling — never needed in any image
+tests
+**/tests
+vitest.config.mts
+coverage
+
+# local database data, backups and dumps
+backups
+pgdata
+**/pgdata
+*.dump
+**/*.dump
+
+# development artifacts and editor state
+.DS_Store
+**/.DS_Store
+*.log
+**/*.log
+npm-debug.log*
+.vscode
+.idea
+README.md
+AGENTS.md
+CLAUDE.md
+docs
+
+# The migrator image needs prisma/schema.prisma and prisma/migrations/**.
+# This negation must remain LAST so nothing above can strip them.
+!prisma

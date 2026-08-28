@@ -50,11 +50,18 @@ async function recoverFromEmailCollision(
 
   // No local row for this Clerk identity, but the address is already taken: the same
   // person signing in through a new Clerk account. Re-link so conversations survive,
-  // but force re-approval so a new identity can never silently inherit an ACTIVE or
-  // ADMIN row. Role is left intact; an admin still has to approve the re-link.
+  // but drop every privilege the old row carried — the re-linked identity restarts as
+  // a PENDING USER. Resetting status alone would not be enough: a row left at
+  // role=ADMIN + status=PENDING is restored to a full ACTIVE ADMIN by an ordinary
+  // Approve. Regaining ADMIN must go through the separate Make Admin action.
   const relinked = await prisma.user.update({
     where: { email },
-    data: { clerkUserId, name, status: "PENDING" },
+    data: {
+      clerkUserId,
+      name,
+      status: "PENDING",
+      role: "USER",
+    },
   });
 
   console.warn(

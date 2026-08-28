@@ -65,6 +65,23 @@ async function readJson<T>(res: Response): Promise<T | null> {
   }
 }
 
+// Pure fetch: no React state. Returns null when the refresh fails, so callers keep
+// the list they already have instead of blanking the sidebar on a transient error.
+async function fetchConversations(): Promise<Conversation[] | null> {
+  try {
+    const res = await fetch("/api/conversations", {
+      cache: "no-store",
+    });
+
+    if (!res.ok) return null;
+
+    const data = await readJson<ConversationListBody>(res);
+    return data?.conversations || [];
+  } catch {
+    return null;
+  }
+}
+
 export default function ChatInterface({
   email,
   isAdmin,
@@ -92,24 +109,25 @@ export default function ChatInterface({
   // it never fabricates conversation history the server does not have.
   const [notice, setNotice] = useState<string | null>(null);
 
-  const loadConversations = useCallback(async () => {
-    try {
-      const res = await fetch("/api/conversations", {
-        cache: "no-store",
-      });
-
-      if (!res.ok) return;
-
-      const data = await readJson<ConversationListBody>(res);
-      setConversations(data?.conversations || []);
-    } catch {
-      // Ignore sidebar refresh errors.
-    }
+  const refreshConversations = useCallback(async () => {
+    const list = await fetchConversations();
+    if (list) setConversations(list);
   }, []);
 
+  // The state update happens in the async continuation, never synchronously in the
+  // effect body. The cancelled flag drops a late response after unmount.
   useEffect(() => {
-    void loadConversations();
-  }, [loadConversations]);
+    let cancelled = false;
+
+    void (async () => {
+      const list = await fetchConversations();
+      if (!cancelled && list) setConversations(list);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({
@@ -301,7 +319,7 @@ export default function ChatInterface({
 
       // Always resync: on failure or cancellation the server may have rolled the turn
       // back, so the sidebar must reflect server truth, not the optimistic update.
-      void loadConversations();
+      void refreshConversations();
     }
   }
 

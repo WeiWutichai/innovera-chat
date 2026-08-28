@@ -1,3 +1,20 @@
+# INNOVERA AI — production composition.
+#
+# Three services with deliberately different lifecycles:
+#   chat-db        long-running, never published to the host
+#   chat-migrator  ONE-SHOT. Runs `prisma migrate deploy` and exits. Never restarts,
+#                  never serves traffic, and is never started by `up`.
+#   chat-app       long-running. Serves traffic. Does NOT run migrations.
+#
+# Migrations are NOT wired into application startup. Coupling them would make a
+# migration failure present as an application outage and would force the Prisma CLI
+# into the serving image. `scripts/deploy.sh` runs the migrator as an explicit step and
+# inspects its exit status before the application is allowed to be replaced.
+#
+# Secrets are never written here. Runtime values come from .env.local (gitignored);
+# ${...} interpolation uses the required-variable form so a missing value aborts loudly
+# instead of substituting empty.
+
 services:
   chat-db:
     image: postgres:16
@@ -5,12 +22,15 @@ services:
     restart: unless-stopped
 
     environment:
-      POSTGRES_DB: ${CHAT_POSTGRES_DB}
-      POSTGRES_USER: ${CHAT_POSTGRES_USER}
-      POSTGRES_PASSWORD: ${CHAT_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${CHAT_POSTGRES_DB:?set CHAT_POSTGRES_DB in .env}
+      POSTGRES_USER: ${CHAT_POSTGRES_USER:?set CHAT_POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${CHAT_POSTGRES_PASSWORD:?set CHAT_POSTGRES_PASSWORD in .env}
 
     volumes:
       - chat_postgres_data:/var/lib/postgresql/data
+
+    # No `ports:` mapping. The database is reachable only from the compose network.
+    # Backups run through `docker compose exec -T`, which needs no exposure.
 
     healthcheck:
       test:
@@ -20,17 +40,22 @@ services:
       timeout: 5s
       retries: 10
 
-  chat-app:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # One-shot. Started only by `docker compose run --rm chat-migrator`, never by `up`,
+  # which is what the `manual` profile enforces.
+  chat-migrator:
+    profiles: ["manual"]
     build:
       context: .
-      args:
-        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+      target: migrator
+    image: innovera-chat-migrator:${IMAGE_TAG:-latest}
+    container_name: innovera-chat-migrator
 
-    container_name: innovera-chat
-    restart: unless-stopped
-
-    ports:
-      - "127.0.0.1:3002:3000"
+    # Never restart: a failed migration must surface as a non-zero exit, not a crash loop.
+    restart: "no"
 
     env_file:
       - .env.local
@@ -41,12 +66,79 @@ services:
 
     networks:
       - default
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  chat-app:
+    build:
+      context: .
+      target: runner
+      args:
+        # Publishable by design and inlined into the client bundle at build time.
+        # The build fails if this is missing or blank rather than baking an empty key.
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?set NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY in .env}
+    # APP_IMAGE lets a rollback pin an IMMUTABLE image ID (sha256:...), which cannot be
+    # expressed through the tag form. Normal deploys use the tag; rollback.sh sets
+    # APP_IMAGE to the digest recorded before the rebuild.
+    image: ${APP_IMAGE:-innovera-chat-runner:${IMAGE_TAG:-latest}}
+    container_name: innovera-chat
+    restart: unless-stopped
+
+    # Loopback only. NGINX terminates TLS and proxies to this address.
+    ports:
+      - "127.0.0.1:3002:3000"
+
+    env_file:
+      - .env.local
+
+    depends_on:
+      chat-db:
+        condition: service_healthy
+
+    # Liveness only — process health. Readiness (/api/health/ready, which checks the
+    # database and required config) is deliberately NOT used here: a brief database
+    # blip must not make Docker kill an otherwise healthy application. The deploy
+    # script polls /ready separately as a deployment gate.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - node -e "fetch('http://127.0.0.1:3000/api/health/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    # A BOUNDED window for graceful termination after SIGTERM. It does NOT guarantee
+    # that in-flight generations complete: the browser, NGINX, LiteLLM and vLLM are
+    # three further hops, any of which may already have given up.
+    stop_grace_period: 30s
+
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+    # Two networks, deliberately:
+    #   default      private chat network, shared with chat-db only
+    #   innovera-ai  the shared AI network where LiteLLM lives
+    # chat-db is NOT on the AI network, so nothing on that network can reach the
+    # database simply by being attached to it.
+    networks:
+      - default
       - innovera-ai
 
 volumes:
   chat_postgres_data:
 
 networks:
+  # chat-db deliberately has NO networks: key, so it stays on `default` only and the
+  # shared AI stack cannot reach the chat database.
+  #
+  # The AI network is EXTERNAL and created by the LiteLLM stack, not by this file. Its
+  # name is configurable rather than hardcoded so a rehearsal can attach a disposable
+  # mock LiteLLM to an equivalent topology without guessing or depending on the
+  # production network name.
   innovera-ai:
     external: true
-    name: innovera_default
+    name: ${AI_NETWORK_NAME:-innovera_default}

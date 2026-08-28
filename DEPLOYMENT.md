@@ -12,12 +12,23 @@ The production application server is a **separate git remote** from the developm
 
 | Remote | Points at | Used for |
 | --- | --- | --- |
-| `github` | `github.com:WeiWutichai/innovera-chat` | All development. Branches, review, merge. |
-| `origin` | the production GPU host | **Deployment only.** Never during normal work. |
+| `origin` | `github.com:WeiWutichai/innovera-chat` | All development. A bare `git push` goes here. |
+| `production` | the production GPU host | Fetch only. **Push is disabled.** |
 
-> **A bare `git push` currently targets `origin`**, because local `main` tracks it. Until
-> the remote-safety change lands, every push must name its remote explicitly:
-> `git push github <branch>`. Never run a bare `git push` in this repository.
+The remotes were renamed so the *safe* destination is the default and the dangerous one
+must be named explicitly. Three layers protect production:
+
+1. `remote.production.pushurl = DISABLED` — a push fails at the transport layer before
+   any network call.
+2. A **versioned** `pre-push` hook at `.githooks/pre-push` refuses any push whose remote
+   is named `production`. It matches on the remote NAME only and contains no host or
+   credential, so it is safe to commit. Deliberate override:
+   `ALLOW_PRODUCTION_PUSH=1 git push production <ref>`.
+3. `remote.pushDefault = origin` and `branch.main.remote = origin`.
+
+> **A fresh clone must enable the hook:** `git config core.hooksPath .githooks`.
+> `core.hooksPath` is local config and does not travel with a clone — which is exactly
+> why the push-URL layer exists as the primary guard rather than the hook.
 
 Normal development must not contact production at all: no fetch, no push, no database
 connection, no LiteLLM call. The test suite enforces the database half of this — it
@@ -116,8 +127,16 @@ Order of operations, each gated on the previous:
 A cleanup trap drops the scratch database and removes the partial archive on **any** exit
 path. The database port is never exposed; everything runs through the Compose service.
 
-**Retention:** 7 daily + 4 weekly, stored **off the GPU host**. A backup on the same disk
-as the volume it protects does not survive the failure that matters.
+**Retention:** `scripts/backup-retention.sh` keeps **7 daily + 4 weekly** verified
+archives. It operates only inside an explicitly configured `BACKUP_DIR`, refuses `/` and
+`$HOME`, uses no bare wildcard `rm`, considers only archives carrying a `.verified`
+marker, and never deletes the newest one.
+
+> **PRODUCTION BLOCKER — off-host storage is not configured.** Retention runs locally
+> only. A backup on the same disk as the volume it protects does not survive the failure
+> that matters, and this host has already run out of disk once. An off-host destination
+> must be chosen and configured before the first production deployment. No credentials or
+> destinations have been invented here.
 
 **Restoring rolls back data as well as schema.** It discards every conversation written
 since the archive. Restore is for corruption and unrecoverable migration failure — never
@@ -157,60 +176,90 @@ none, some, or one file fully and the next partially applied.
 ## 6. Deployment is a controlled single-replica restart
 
 There is **one** application replica behind NGINX. Replacing it means stopping it and
-starting another. There is no pool, no cutover, and no blue/green.
+starting another. **A short service interruption is expected**, from the moment the old
+container stops until the new one passes readiness. Health checks confirm the new
+instance came up; they do not gate a traffic switch, because there is no switch.
 
-**A short service interruption is expected.** It begins when the old container stops and
-ends when the new one passes readiness. Health checks confirm the new instance came up
-correctly; they do not gate a traffic switch, because there is no switch.
+### Staging rehearsal
 
-Sequence: verified backup → record the rollback target → validate configuration → check
-migration status → run all gates → build → **migrate** → assess migration success →
-recreate the container → wait for `/api/health/live` with a bounded timeout → wait for
-`/api/health/ready` with a bounded timeout → smoke tests.
+The commands below were executed against a disposable Colima stack. `scripts/deploy.sh`
+accepts overrides so a rehearsal never touches production:
 
-Health endpoints:
+```
+DEPLOY_COMPOSE="docker compose -f <rehearsal>.yml -p <project>" \
+DEPLOY_APP_URL="http://127.0.0.1:<port>" \
+BACKUP_DIR=<tmp>/backups BACKUP_EXEC="docker compose -f <rehearsal>.yml -p <project> exec -T chat-db" \
+SKIP_BUILD=1 \
+  bash scripts/deploy.sh
+```
+
+### Production deployment
+
+```
+bash scripts/deploy.sh
+```
+
+It performs, failing closed at every step:
+
+| Step | Action | On failure |
+| --- | --- | --- |
+| 1 | Validate required configuration (names only, never values) | stop |
+| 2 | Start and await the database | stop |
+| 3 | **Verified backup** — must produce a NEW `.verified` marker | stop, before migrating |
+| 4 | Build runner + migrator from the same source | stop |
+| 5 | **Migrate** (one-shot container, before the app is replaced) | **stop — see below** |
+| 6 | Recreate the application (**interruption starts**) | — |
+| 7 | Bounded `/live` then `/ready` polls | roll back |
+| 8 | Landing page, static asset, signed-out API smoke | roll back |
+
+A **deployment lock** (atomic `mkdir`, not `flock` — absent on macOS) makes a second
+concurrent deployment fail cleanly. The lock is released on every exit path while
+preserving the failure status.
+
+### Health endpoints
 
 | Endpoint | Answers | Checks |
 | --- | --- | --- |
-| `GET /api/health/live` | Is the process alive? | Nothing. If it touched the database, a brief blip would make the healthcheck restart a healthy app. |
-| `GET /api/health/ready` | Should this instance receive traffic? | Required runtime configuration, plus a `SELECT 1` bounded to 2s. |
+| `GET /api/health/live` | Is the process alive? | Nothing. Used by the Docker healthcheck. |
+| `GET /api/health/ready` | Should this instance receive traffic? | Required config + a 2s-bounded `SELECT 1`. Used by the deploy gate only. |
 
-The readiness timeout **stops waiting** for the query; it does not cancel it. No
-cancellation request is sent to PostgreSQL and the statement runs to completion on its
-connection. That is acceptable only because the probe is `SELECT 1` — trivial, holding no
-locks. A heavier readiness query would need a server-side `statement_timeout` instead.
+`/ready` is deliberately **not** the Docker healthcheck: a brief database blip must not
+make Docker kill a healthy application. Verified — with the database stopped, `/ready`
+returned 503 while `/live` stayed 200 and Docker health remained `healthy`.
 
-LiteLLM is **not** part of readiness. If the GPU backend is down the app still serves
-history, admin and authentication, and returns a clean 502 for chat. Removing the whole
-app over a partial dependency would be worse. Upstream health is a monitoring signal.
+LiteLLM is **not** part of readiness.
 
-Neither endpoint reveals a failure reason in its body — the reason goes to the log.
+### If the migration fails
 
----
+The deployment stops. The application is **not** replaced and the previous version keeps
+serving — verified by container id before and after.
+
+**The database state is UNKNOWN until assessed.** Do not automatically restore. Follow
+§5.
 
 ## 7. Application rollback is **not** database rollback
 
-Two separate decisions with separate blast radii. Make them separately, every time.
+```
+bash scripts/rollback.sh <previous-image-tag>
+```
 
-Rollback sequence: stop the failed new application → **confirm database compatibility
-with the previous application** (mandatory; never skipped because it usually passes) →
-start the previously recorded image → verify `/live` then `/ready` → run the same smoke
-tests. A rollback is a deployment and gets the same verification.
+Stops the failed application, starts the recorded previous image, re-runs the `/live`,
+`/ready` and smoke gates. It **never** touches the database: it contains no
+`pg_restore`, no `DROP DATABASE`, no `migrate resolve`, no `migrate reset`. Verified —
+applied-migration count and table count were identical before and after.
 
-Do **not** restore the database unless the compatibility assessment shows the schema
-supports neither version.
+**Before rolling back you must assess** whether the previous application is compatible
+with the current schema. That cannot be automated.
 
-### When rollback is unsafe
+For **this release specifically**, the pending production migration is the `Usage` index
+swap, which is backward-compatible with the previous application. **Do not generalise
+that to future migrations.**
 
-- **A destructive migration ran.** Dropped or retyped columns mean old code queries a
-  schema that no longer exists. Use expand/contract: add the new shape, deploy code that
-  writes both, backfill, contract in a *later* release. Never expand and contract in one
-  deploy.
-- **New-format data has been written** that the old version cannot interpret.
-- **The migration failed midway.** Assess the actual schema first. This is the case the
-  verified backup exists for.
+### Database recovery — manual incident procedure
 
----
+Restoring a backup rolls back **data as well as schema** and discards every conversation
+written since it was taken. It is for corruption and unrecoverable migration failure —
+never a routine consequence of an application problem. See §4 for the restore command.
 
 ## 8. Security header ownership
 
@@ -228,3 +277,46 @@ There is **no in-app path** to create the first ADMIN — `/admin` is reachable 
 existing ACTIVE ADMIN. The first one is promoted by direct SQL against the database.
 Losing every ADMIN is recoverable only the same way, which is why the application refuses
 to disable or demote the last active administrator.
+
+---
+
+## 10. Production deployment checklist — BLOCKERS
+
+These have **not** been performed. They are required before the first real deployment.
+
+- [ ] **Backup taken against the real production database**, restore verified, `.verified`
+      marker retained, archive copied **off-host**, and filename / timestamp / checksum
+      recorded. Deliberately not executed during development — it runs immediately before
+      the approved deployment, after a full staging rehearsal.
+- [ ] **Off-host backup destination configured** (see §4).
+- [ ] **NGINX `proxy_read_timeout` confirmed ≥ the application AI timeout** (540 s).
+- [ ] **Confirm NGINX sends no Content-Security-Policy** before the application ever adds
+      one — two policies are enforced as an intersection and would break Clerk sign-in.
+- [ ] **First ADMIN exists** (see §9) — there is no in-app path to create one.
+- [ ] **Rollback target recorded** — the currently running image id, before deploying.
+
+## 11. NGINX / TLS expectations
+
+Documented for reference. **Not modified by this work.**
+
+- Proxies to `127.0.0.1:3002`, the only address the application binds.
+- **Terminates HTTPS.** The existing Let's Encrypt certificate is retained.
+- **Owns HSTS.** The application must never send `Strict-Transport-Security`: it is
+  reached over plain HTTP on loopback and cannot know whether the client used TLS.
+- `proxy_read_timeout` / `proxy_send_timeout` must exceed the application's AI generation
+  timeout (`CHAT_UPSTREAM_TIMEOUT_MS`, default 540 s) so the proxy does not sever a
+  request the application is still legitimately serving.
+- The application owns `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options` and
+  `Permissions-Policy`. Duplicating them at the proxy is harmless; duplicating CSP is not.
+
+## 12. Graceful shutdown — what `stop_grace_period` actually provides
+
+`stop_grace_period: 30s` gives the container a **bounded window for graceful termination**
+after `SIGTERM`, and may allow in-flight requests to complete.
+
+It does **not** prove the browser is still connected, that NGINX still holds the upstream
+request, that LiteLLM still holds its side, or that vLLM finishes generating. A chat turn
+spans four hops; a grace period bounds only one of them.
+
+No application-level request draining is implemented, deliberately: with a single replica
+there is nowhere to drain traffic to.

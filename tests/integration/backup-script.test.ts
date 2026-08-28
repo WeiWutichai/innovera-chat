@@ -167,7 +167,10 @@ describe("failure paths fail closed", () => {
     });
 
     expect(result.code).not.toBe(0);
-    expect(result.stderr).toMatch(/missing table/i);
+    // The restore produced no tables while the source has four: the structural
+    // comparison must reject it and name both sets.
+    expect(result.stderr).toMatch(/restored table set differs from the source/i);
+    expect(result.stderr).toMatch(/User/);
     expect(verified()).toHaveLength(0);
   }, 120_000);
 

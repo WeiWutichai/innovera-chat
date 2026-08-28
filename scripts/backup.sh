@@ -95,31 +95,53 @@ ${EXEC} pg_restore -U "${CHAT_POSTGRES_USER}" -d "${CHECK_DB}" --no-owner < "${F
 
 # --- 5. structural verification of the restored database ----------------------
 #
-# Deliberately NOT an equality check against the live database. The application stays
-# writable during a backup, so the source moves on the moment the dump finishes: a dump
-# capturing 1000 messages is perfectly valid even though the live table already holds
-# 1002. Comparing the two would fail correct backups and, worse, train whoever runs this
-# to ignore the failure.
+# Verifies that the restore reproduces what the SOURCE actually contained, rather than
+# asserting a hardcoded table list. That distinction matters: a fixed list cannot pass
+# against a database that has not been migrated yet, so it would block the very first
+# deployment — the one moment a verified backup is most valuable.
 #
-# Exact equality is only meaningful if the source is quiesced or both observations come
-# from one consistent snapshot. Neither is true here and neither is worth building in
-# this phase. What IS proved: the archive restores, every expected table exists, and
-# every expected table can actually be read. Counts are RECORDED for audit, not compared.
+# Deliberately NOT an equality check on ROW COUNTS against the live database. The
+# application stays writable during a backup, so the source moves on the moment the dump
+# finishes: a dump capturing 1000 messages is valid even though the live table already
+# holds 1002. Counts are RECORDED for audit, never compared.
 echo "[5/6] verifying restored structure"
 
-for table in ${EXPECTED_TABLES}; do
-  present="$(${EXEC} psql -U "${CHAT_POSTGRES_USER}" -d "${CHECK_DB}" -tAc \
-    "SELECT to_regclass('public.\"${table}\"') IS NOT NULL" 2>/dev/null || true)"
-  [ "${present}" = "t" ] || fail "restored archive is missing table \"${table}\""
+list_tables() {
+  ${EXEC} psql -U "${CHAT_POSTGRES_USER}" -d "$1" -tAc \
+    "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> '_prisma_migrations' ORDER BY tablename" \
+    2>/dev/null | tr -d '\r'
+}
 
-  ${EXEC} psql -U "${CHAT_POSTGRES_USER}" -d "${CHECK_DB}" -tAc \
-    "SELECT count(*) FROM \"${table}\"" >/dev/null 2>&1 \
-    || fail "restored table \"${table}\" could not be queried"
-done
+SOURCE_TABLES="$(list_tables "${CHAT_POSTGRES_DB}")" || fail "could not list source tables"
+CHECK_TABLES="$(list_tables "${CHECK_DB}")"           || fail "could not list restored tables"
 
-RESTORED_COUNTS="$(count_rows "${CHECK_DB}")" || fail "could not read restored row counts"
-printf 'User\tConversation\tMessage\tUsage\n%s\n' "${RESTORED_COUNTS}" > "${FINAL}.counts"
-echo "      restored counts (User/Conversation/Message/Usage): ${RESTORED_COUNTS}"
+if [ "${SOURCE_TABLES}" != "${CHECK_TABLES}" ]; then
+  fail "restored table set differs from the source. source=[$(echo ${SOURCE_TABLES} | tr '\n' ' ')] restored=[$(echo ${CHECK_TABLES} | tr '\n' ' ')]"
+fi
+
+if [ -z "${SOURCE_TABLES}" ]; then
+  # A pre-migration database. The dump is still valid and still verified: there was
+  # simply nothing to capture. Recorded explicitly so this is never mistaken for a
+  # silently-empty backup of a populated database.
+  echo "      source database has no application tables yet (pre-migration) — nothing to restore"
+  printf 'source_tables\n(none — pre-migration)\n' > "${FINAL}.counts"
+else
+  for table in ${SOURCE_TABLES}; do
+    ${EXEC} psql -U "${CHAT_POSTGRES_USER}" -d "${CHECK_DB}" -tAc \
+      "SELECT count(*) FROM \"${table}\"" >/dev/null 2>&1 \
+      || fail "restored table \"${table}\" could not be queried"
+  done
+  echo "      restored tables verified queryable: $(echo ${SOURCE_TABLES} | tr '\n' ' ')"
+
+  # Record counts for audit when the application schema is present.
+  if echo "${SOURCE_TABLES}" | grep -q '^User$'; then
+    RESTORED_COUNTS="$(count_rows "${CHECK_DB}")" || fail "could not read restored row counts"
+    printf 'User\tConversation\tMessage\tUsage\n%s\n' "${RESTORED_COUNTS}" > "${FINAL}.counts"
+    echo "      restored counts (User/Conversation/Message/Usage): ${RESTORED_COUNTS}"
+  else
+    printf 'tables\n%s\n' "$(echo ${SOURCE_TABLES} | tr '\n' ' ')" > "${FINAL}.counts"
+  fi
+fi
 
 # --- 6. only now is the backup verified ---------------------------------------
 echo "[6/6] verified"

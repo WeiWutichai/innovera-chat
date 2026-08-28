@@ -1,0 +1,52 @@
+services:
+  chat-db:
+    image: postgres:16
+    container_name: innovera-chat-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${CHAT_POSTGRES_DB}
+      POSTGRES_USER: ${CHAT_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${CHAT_POSTGRES_PASSWORD}
+
+    volumes:
+      - chat_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${CHAT_POSTGRES_USER} -d ${CHAT_POSTGRES_DB}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  chat-app:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+
+    container_name: innovera-chat
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:3002:3000"
+
+    env_file:
+      - .env.local
+
+    depends_on:
+      chat-db:
+        condition: service_healthy
+
+    networks:
+      - default
+      - innovera-ai
+
+volumes:
+  chat_postgres_data:
+
+networks:
+  innovera-ai:
+    external: true
+    name: innovera_default

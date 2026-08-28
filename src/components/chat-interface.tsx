@@ -50,6 +50,7 @@ type ChatSuccessBody = {
 
 type ChatErrorBody = {
   error?: string;
+  reason?: string;
   correlationId?: string;
   conversationId?: string | null;
 };
@@ -83,6 +84,14 @@ export default function ChatInterface({
   // slower earlier click can no longer overwrite the result of a faster later one.
   const openRequestId = useRef(0);
 
+  // Aborts the in-flight /api/chat request when the user presses Stop. See
+  // stopGeneration() for exactly what this does and does not guarantee.
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Non-error status line (e.g. cancellation). Kept separate from the message list so
+  // it never fabricates conversation history the server does not have.
+  const [notice, setNotice] = useState<string | null>(null);
+
   const loadConversations = useCallback(async () => {
     try {
       const res = await fetch("/api/conversations", {
@@ -114,6 +123,7 @@ export default function ChatInterface({
     // Invalidate any in-flight history load so it cannot repopulate the new chat.
     openRequestId.current += 1;
 
+    setNotice(null);
     setConversationId(null);
     setMessages([]);
     setInput("");
@@ -124,6 +134,7 @@ export default function ChatInterface({
 
     const requestId = (openRequestId.current += 1);
 
+    setNotice(null);
     setLoadingHistory(true);
 
     try {
@@ -186,6 +197,7 @@ export default function ChatInterface({
     // the previous conversation while the screen already showed the new one.
     if (!text || loading || loadingHistory) return;
 
+    setNotice(null);
     setInput("");
 
     setMessages((prev) => [
@@ -198,6 +210,9 @@ export default function ChatInterface({
 
     setLoading(true);
 
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -208,6 +223,7 @@ export default function ChatInterface({
           message: text,
           conversationId,
         }),
+        signal: controller.signal,
       });
 
       if (!res.ok) {
@@ -256,27 +272,44 @@ export default function ChatInterface({
         },
       ]);
     } catch (error) {
-      const errorMessage =
-        error instanceof Error
-          ? error.message
-          : "Unknown error";
+      // A user-initiated cancellation is not a failure and must not be rendered as one.
+      if (error instanceof Error && error.name === "AbortError") {
+        // The server rolls the turn back on disconnect, so drop the optimistic bubble
+        // and hand the text back instead of leaving an unanswered message on screen.
+        setMessages((prev) => prev.slice(0, -1));
+        setInput(text);
+        setNotice("ยกเลิกคำขอแล้ว");
+      } else {
+        const errorMessage =
+          error instanceof Error
+            ? error.message
+            : "Unknown error";
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content:
-            "เกิดข้อผิดพลาดในการเชื่อมต่อ INNOVERA AI\n\n" +
-            errorMessage,
-        },
-      ]);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content:
+              "เกิดข้อผิดพลาดในการเชื่อมต่อ INNOVERA AI\n\n" +
+              errorMessage,
+          },
+        ]);
+      }
     } finally {
+      abortRef.current = null;
       setLoading(false);
 
-      // Always resync: on failure the server may have rolled the turn back, so the
-      // sidebar must reflect server truth rather than the optimistic update.
+      // Always resync: on failure or cancellation the server may have rolled the turn
+      // back, so the sidebar must reflect server truth, not the optimistic update.
       void loadConversations();
     }
+  }
+
+  // Aborts the browser's request. Whether the upstream generation itself stops is a
+  // server-side concern; the wording here deliberately claims only that the request was
+  // cancelled. See the Phase 2 notes on req.signal propagation.
+  function stopGeneration() {
+    abortRef.current?.abort();
   }
 
   return (
@@ -411,6 +444,12 @@ export default function ChatInterface({
           </div>
 
           <div className="border-t border-white/10 p-5">
+            {notice && (
+              <div className="mx-auto mb-3 max-w-3xl text-sm text-white/50">
+                {notice}
+              </div>
+            )}
+
             <div className="mx-auto max-w-3xl rounded-2xl border border-white/15 bg-white/5 p-4">
               <textarea
                 value={input}
@@ -437,22 +476,29 @@ export default function ChatInterface({
                   ขึ้นบรรทัดใหม่
                 </span>
 
-                <button
-                  type="button"
-                  onClick={() =>
-                    void sendMessage()
-                  }
-                  disabled={
-                    loading ||
-                    loadingHistory ||
-                    !input.trim()
-                  }
-                  className="rounded-lg bg-white px-5 py-2 font-medium text-black disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {loading
-                    ? "Sending..."
-                    : "Send"}
-                </button>
+                {loading ? (
+                  <button
+                    type="button"
+                    onClick={stopGeneration}
+                    className="rounded-lg border border-white/30 px-5 py-2 font-medium text-white hover:bg-white/10"
+                  >
+                    Stop
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void sendMessage()
+                    }
+                    disabled={
+                      loadingHistory ||
+                      !input.trim()
+                    }
+                    className="rounded-lg bg-white px-5 py-2 font-medium text-black disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Send
+                  </button>
+                )}
               </div>
             </div>
           </div>

@@ -77,6 +77,9 @@ model Usage {
 
   user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])
+  // Serves the daily-quota aggregate (sum totalTokens where userId + createdAt >= dayStart),
+  // which runs on every chat request. The former standalone @@index([userId]) was a strict
+  // left-prefix of this composite and has been dropped as redundant.
+  @@index([userId, createdAt])
   @@index([createdAt])
 }

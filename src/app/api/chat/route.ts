@@ -1,14 +1,16 @@
 import { auth } from "@clerk/nextjs/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
-
-// One more than the 20-message window, so trimming a leading assistant turn cannot
-// shrink the effective context below the intended size.
-const CONTEXT_FETCH_LIMIT = 21;
-const MAX_MESSAGE_LENGTH = 20000;
+import { chatConfig, getUpstreamConfig } from "@/lib/chat-config";
+import {
+  checkRateLimit,
+  acquireSlot,
+  createSlotRelease,
+} from "@/lib/rate-limiter";
+import { checkDailyQuota } from "@/lib/usage-quota";
 
 const chatRequestSchema = z.object({
-  message: z.string().trim().min(1).max(MAX_MESSAGE_LENGTH),
+  message: z.string().trim().min(1).max(chatConfig.maxMessageLength),
   conversationId: z.string().nullish(),
 });
 
@@ -22,13 +24,26 @@ type ChatCompletion = {
 };
 
 // Fixed strings. Upstream error text is never forwarded to the browser: it can carry
-// provider, host, model and internal configuration detail no end user should see.
+// provider, host, model and internal configuration detail no end user should see. The
+// underlying model identity (Qwen) is never exposed — the browser only ever sees the
+// "innovera-ai" alias it already knows.
 const UPSTREAM_BUSY =
   "ระบบ AI มีผู้ใช้งานจำนวนมาก กรุณาลองใหม่อีกครั้ง";
 const UPSTREAM_UNAVAILABLE =
   "ระบบ AI ไม่พร้อมใช้งานชั่วคราว กรุณาลองใหม่อีกครั้ง";
 const UPSTREAM_EMPTY =
   "ระบบ AI ไม่ได้ส่งคำตอบกลับมา กรุณาลองใหม่อีกครั้ง";
+const UPSTREAM_TIMEOUT =
+  "ระบบ AI ใช้เวลาตอบนานเกินกำหนด กรุณาลองใหม่อีกครั้ง";
+const NOT_CONFIGURED =
+  "ระบบ AI ยังไม่พร้อมใช้งาน กรุณาติดต่อผู้ดูแลระบบ";
+const RATE_LIMITED =
+  "คุณส่งคำขอถี่เกินไป กรุณารอสักครู่แล้วลองใหม่";
+const TOO_MANY_IN_FLIGHT =
+  "คุณมีคำขอที่กำลังประมวลผลอยู่ กรุณารอให้เสร็จก่อน";
+const QUOTA_EXCEEDED =
+  "คุณใช้โควตาโทเค็นประจำวันครบแล้ว กรุณาลองใหม่ในวันถัดไป";
+const REQUEST_CANCELLED = "ยกเลิกคำขอแล้ว";
 
 function messageForUpstreamStatus(status: number) {
   return status === 429 ? UPSTREAM_BUSY : UPSTREAM_UNAVAILABLE;
@@ -65,11 +80,51 @@ function isCrossSiteRequest(req: Request) {
   }
 }
 
+type ContextMessage = { role: string; content: string };
+
+/**
+ * Selects the trailing slice of the conversation that fits the character budget.
+ *
+ * Walks newest-first and admits only whole messages, so a turn is never truncated
+ * mid-content. The newest message is always retained even if it alone exceeds the
+ * budget, so a request can never be starved to an empty context. The leading trim
+ * preserves the Phase 1 invariant that context never begins with an assistant turn.
+ */
+function selectContextWithinBudget(
+  ordered: ContextMessage[],
+  charBudget: number
+) {
+  const selected: ContextMessage[] = [];
+  let usedChars = 0;
+
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    const message = ordered[i];
+    const cost = message.content.length;
+
+    if (selected.length > 0 && usedChars + cost > charBudget) {
+      break;
+    }
+
+    selected.unshift(message);
+    usedChars += cost;
+  }
+
+  while (selected.length > 1 && selected[0].role !== "USER") {
+    const dropped = selected.shift();
+    usedChars -= dropped ? dropped.content.length : 0;
+  }
+
+  return { selected, usedChars };
+}
+
 export async function POST(req: Request) {
   const correlationId = crypto.randomUUID().slice(0, 8);
 
   // Set once the user's turn is persisted, so any later failure can undo it.
   let rollbackTurn: (() => Promise<void>) | null = null;
+  // Set once a concurrency slot is held. Released exactly once in `finally`.
+  let releaseConcurrencySlot: (() => void) | null = null;
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
   try {
     if (isCrossSiteRequest(req)) {
@@ -82,6 +137,17 @@ export async function POST(req: Request) {
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    // Validated before any database work so a misconfigured deployment fails cleanly
+    // instead of persisting a turn it can never answer.
+    const upstream = getUpstreamConfig();
+
+    if (!upstream) {
+      return Response.json(
+        { error: NOT_CONFIGURED, reason: "not_configured", correlationId },
+        { status: 503 }
+      );
+    }
+
     const appUser = await prisma.user.findUnique({
       where: { clerkUserId: userId },
     });
@@ -90,6 +156,17 @@ export async function POST(req: Request) {
       return Response.json(
         { error: "Account is not active" },
         { status: 403 }
+      );
+    }
+
+    // Cheapest rejection first: no body parsing, no slot, no database read. Aborted and
+    // rejected attempts are recorded too, so hammering cannot reset the window.
+    const rate = checkRateLimit(appUser.id, chatConfig.rateLimitPerMinute);
+
+    if (!rate.allowed) {
+      return Response.json(
+        { error: RATE_LIMITED, reason: "rate_limited", correlationId },
+        { status: 429, headers: { "Retry-After": String(rate.retryAfterSeconds) } }
       );
     }
 
@@ -119,6 +196,32 @@ export async function POST(req: Request) {
 
     const message = parsed.data.message;
     const requestedConversationId = parsed.data.conversationId ?? null;
+
+    // Acquired BEFORE the quota read. This is what bounds quota overshoot: at most
+    // `maxConcurrentPerUser` requests can be racing the check at any instant.
+    if (!acquireSlot(appUser.id, chatConfig.maxConcurrentPerUser)) {
+      return Response.json(
+        { error: TOO_MANY_IN_FLIGHT, reason: "concurrency_limit", correlationId },
+        { status: 429 }
+      );
+    }
+
+    releaseConcurrencySlot = createSlotRelease(appUser.id);
+
+    const quota = await checkDailyQuota(appUser.id, appUser.dailyTokenLimit);
+
+    if (!quota.withinQuota) {
+      return Response.json(
+        {
+          error: QUOTA_EXCEEDED,
+          reason: "quota_exceeded",
+          correlationId,
+          usedToday: quota.used,
+          dailyTokenLimit: quota.limit,
+        },
+        { status: 429 }
+      );
+    }
 
     let conversationId: string;
     let conversationTitle: string | null;
@@ -207,12 +310,34 @@ export async function POST(req: Request) {
       }
     };
 
+    // Records genuine GPU consumption on a turn that is being rolled back. Only ever
+    // called with usage the upstream actually reported — never an estimate.
+    const recordUsageOnly = async (usage: ChatCompletion["usage"]) => {
+      try {
+        await prisma.usage.create({
+          data: {
+            userId: appUser.id,
+            promptTokens: usage?.prompt_tokens ?? 0,
+            completionTokens: usage?.completion_tokens ?? 0,
+            totalTokens: usage?.total_tokens ?? 0,
+            requestCount: 1,
+          },
+        });
+      } catch {
+        console.error(
+          "chat.usage_record_failed",
+          JSON.stringify({ correlationId })
+        );
+      }
+    };
+
     // Returning the conversation id lets the client resynchronise when the turn could
     // not be rolled back; a rolled-back new conversation reports null.
-    const failure = (status: number, error: string) =>
+    const failure = (status: number, error: string, reason: string) =>
       Response.json(
         {
           error,
+          reason,
           correlationId,
           conversationId:
             createdConversation && rolledBack ? null : conversationId,
@@ -227,21 +352,17 @@ export async function POST(req: Request) {
       orderBy: {
         createdAt: "desc",
       },
-      take: CONTEXT_FETCH_LIMIT,
+      take: chatConfig.contextFetchLimit,
     });
 
     recentMessages.reverse();
 
-    // The current user row is written before this read, so an otherwise-full window
-    // would begin mid-turn on an assistant message from the 11th turn onward.
-    while (
-      recentMessages.length > 1 &&
-      recentMessages[0].role !== "USER"
-    ) {
-      recentMessages.shift();
-    }
+    const { selected, usedChars } = selectContextWithinBudget(
+      recentMessages,
+      chatConfig.contextCharBudget
+    );
 
-    const aiMessages = recentMessages.map((m) => ({
+    const aiMessages = selected.map((m) => ({
       role:
         m.role === "USER"
           ? "user"
@@ -251,23 +372,79 @@ export async function POST(req: Request) {
       content: m.content,
     }));
 
-    const response = await fetch(
-      `${process.env.LITELLM_BASE_URL}/v1/chat/completions`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.LITELLM_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "innovera-ai",
-          messages: aiMessages,
-          max_tokens: 1500,
-          temperature: 0.7,
-        }),
-        cache: "no-store",
-      }
+    // Two independent abort sources, combined: the application's own generation
+    // deadline, and the client going away. `AbortSignal.any` propagates whichever
+    // fires first to the upstream fetch.
+    const timeoutController = new AbortController();
+    timeoutTimer = setTimeout(
+      () => timeoutController.abort(),
+      chatConfig.upstreamTimeoutMs
     );
+
+    const upstreamSignal = AbortSignal.any([
+      timeoutController.signal,
+      req.signal,
+    ]);
+
+    let response: Response;
+
+    try {
+      response = await fetch(
+        `${upstream.baseUrl}/v1/chat/completions`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${upstream.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: "innovera-ai",
+            messages: aiMessages,
+            max_tokens: 1500,
+            temperature: 0.7,
+            // Stable internal identifier for upstream attribution. Never the email
+            // address or any other personally identifying field.
+            user: appUser.id,
+          }),
+          cache: "no-store",
+          signal: upstreamSignal,
+        }
+      );
+    } catch (error) {
+      const aborted =
+        error instanceof Error &&
+        (error.name === "AbortError" || error.name === "TimeoutError");
+
+      if (aborted && timeoutController.signal.aborted) {
+        console.error(
+          "chat.upstream_timeout",
+          JSON.stringify({ correlationId, timeoutMs: chatConfig.upstreamTimeoutMs })
+        );
+        await rollbackTurn();
+        return failure(504, UPSTREAM_TIMEOUT, "timeout");
+      }
+
+      if (aborted && req.signal.aborted) {
+        // The client stopped waiting. No usage was reported, so nothing is recorded —
+        // see the known limitation documented in the Phase 2 notes.
+        console.warn(
+          "chat.client_cancelled",
+          JSON.stringify({ correlationId })
+        );
+        await rollbackTurn();
+        return failure(499, REQUEST_CANCELLED, "cancelled");
+      }
+
+      console.error(
+        "chat.upstream_unreachable",
+        JSON.stringify({
+          correlationId,
+          name: error instanceof Error ? error.name : "unknown",
+        })
+      );
+      await rollbackTurn();
+      return failure(502, UPSTREAM_UNAVAILABLE, "upstream");
+    }
 
     // Status is checked before the body is parsed. Parsing first turned every non-JSON
     // upstream error into a generic 500 and left this branch unreachable.
@@ -295,7 +472,11 @@ export async function POST(req: Request) {
 
       await rollbackTurn();
 
-      return failure(502, messageForUpstreamStatus(response.status));
+      return failure(
+        502,
+        messageForUpstreamStatus(response.status),
+        "upstream"
+      );
     }
 
     let data: ChatCompletion;
@@ -310,7 +491,7 @@ export async function POST(req: Request) {
 
       await rollbackTurn();
 
-      return failure(502, UPSTREAM_UNAVAILABLE);
+      return failure(502, UPSTREAM_UNAVAILABLE, "upstream");
     }
 
     const rawAnswer = data?.choices?.[0]?.message?.content;
@@ -327,7 +508,13 @@ export async function POST(req: Request) {
 
       await rollbackTurn();
 
-      return failure(502, UPSTREAM_EMPTY);
+      // The model still ran. When upstream reported real usage, it is recorded against
+      // the quota even though the turn itself is discarded.
+      if (data?.usage) {
+        await recordUsageOnly(data.usage);
+      }
+
+      return failure(502, UPSTREAM_EMPTY, "upstream");
     }
 
     const usage = data?.usage ?? {};
@@ -360,6 +547,16 @@ export async function POST(req: Request) {
     // The turn is committed; nothing after this point may undo it.
     rollbackTurn = null;
 
+    console.info(
+      "chat.completed",
+      JSON.stringify({
+        correlationId,
+        contextMessages: aiMessages.length,
+        contextChars: usedChars,
+        totalTokens: usage.total_tokens ?? null,
+      })
+    );
+
     return Response.json({
       conversationId,
       title: conversationTitle,
@@ -383,5 +580,15 @@ export async function POST(req: Request) {
       { error: "Internal server error", correlationId },
       { status: 500 }
     );
+  } finally {
+    // The upstream operation has terminated one way or another by the time any return
+    // path unwinds to here, so the slot is genuinely free.
+    if (timeoutTimer) {
+      clearTimeout(timeoutTimer);
+    }
+
+    if (releaseConcurrencySlot) {
+      releaseConcurrencySlot();
+    }
   }
 }

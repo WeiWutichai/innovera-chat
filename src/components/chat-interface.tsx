@@ -27,6 +27,43 @@ type Props = {
   isAdmin: boolean;
 };
 
+type ConversationListBody = {
+  conversations?: Conversation[];
+};
+
+type ConversationDetailBody = {
+  conversation?: {
+    id: string;
+    messages: Array<{
+      id: string;
+      role: string;
+      content: string;
+    }>;
+  };
+};
+
+type ChatSuccessBody = {
+  conversationId: string;
+  title: string | null;
+  message: string;
+};
+
+type ChatErrorBody = {
+  error?: string;
+  correlationId?: string;
+  conversationId?: string | null;
+};
+
+// A failing response often carries an HTML body rather than JSON. Parsing it before the
+// status was checked masked the real status behind a JSON syntax error.
+async function readJson<T>(res: Response): Promise<T | null> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
 export default function ChatInterface({
   email,
   isAdmin,
@@ -42,6 +79,10 @@ export default function ChatInterface({
 
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Monotonic id for conversation-open requests. Only the newest may write state, so a
+  // slower earlier click can no longer overwrite the result of a faster later one.
+  const openRequestId = useRef(0);
+
   const loadConversations = useCallback(async () => {
     try {
       const res = await fetch("/api/conversations", {
@@ -50,8 +91,8 @@ export default function ChatInterface({
 
       if (!res.ok) return;
 
-      const data = await res.json();
-      setConversations(data.conversations || []);
+      const data = await readJson<ConversationListBody>(res);
+      setConversations(data?.conversations || []);
     } catch {
       // Ignore sidebar refresh errors.
     }
@@ -68,7 +109,10 @@ export default function ChatInterface({
   }, [messages, loading]);
 
   function newChat() {
-    if (loading) return;
+    if (loading || loadingHistory) return;
+
+    // Invalidate any in-flight history load so it cannot repopulate the new chat.
+    openRequestId.current += 1;
 
     setConversationId(null);
     setMessages([]);
@@ -76,7 +120,9 @@ export default function ChatInterface({
   }
 
   async function openConversation(id: string) {
-    if (loading) return;
+    if (loading || loadingHistory) return;
+
+    const requestId = (openRequestId.current += 1);
 
     setLoadingHistory(true);
 
@@ -88,49 +134,57 @@ export default function ChatInterface({
         }
       );
 
-      const data = await res.json();
-
       if (!res.ok) {
+        const errorData = await readJson<ChatErrorBody>(res);
+
         throw new Error(
-          data?.error || "Unable to load conversation"
+          errorData?.error ||
+            `Unable to load conversation (${res.status})`
         );
       }
+
+      const data = await readJson<ConversationDetailBody>(res);
+
+      if (!data?.conversation) {
+        throw new Error("Unable to load conversation");
+      }
+
+      // A newer open or a new chat has superseded this request.
+      if (openRequestId.current !== requestId) return;
 
       setConversationId(data.conversation.id);
 
       setMessages(
         data.conversation.messages
           .filter(
-            (m: { role: string }) =>
+            (m) =>
               m.role === "USER" ||
               m.role === "ASSISTANT"
           )
-          .map(
-            (m: {
-              id: string;
-              role: string;
-              content: string;
-            }) => ({
-              id: m.id,
-              role:
-                m.role === "USER"
-                  ? "user"
-                  : "assistant",
-              content: m.content,
-            })
-          )
+          .map((m) => ({
+            id: m.id,
+            role:
+              m.role === "USER"
+                ? ("user" as const)
+                : ("assistant" as const),
+            content: m.content,
+          }))
       );
     } catch (error) {
       console.error(error);
     } finally {
-      setLoadingHistory(false);
+      if (openRequestId.current === requestId) {
+        setLoadingHistory(false);
+      }
     }
   }
 
   async function sendMessage() {
     const text = input.trim();
 
-    if (!text || loading) return;
+    // Sending while a conversation is still loading used to persist the message into
+    // the previous conversation while the screen already showed the new one.
+    if (!text || loading || loadingHistory) return;
 
     setInput("");
 
@@ -156,11 +210,37 @@ export default function ChatInterface({
         }),
       });
 
-      const data = await res.json();
-
       if (!res.ok) {
+        const errorData = await readJson<ChatErrorBody>(res);
+
+        // The server returns the id when it could not undo the turn, so the next send
+        // continues that conversation instead of starting a second one.
+        if (errorData?.conversationId) {
+          setConversationId(errorData.conversationId);
+        }
+
+        if (res.status === 401) {
+          throw new Error(
+            "เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่"
+          );
+        }
+
+        if (!errorData?.error) {
+          throw new Error(`Request failed (${res.status})`);
+        }
+
         throw new Error(
-          data?.error || "Request failed"
+          errorData.correlationId
+            ? `${errorData.error} (ref: ${errorData.correlationId})`
+            : errorData.error
+        );
+      }
+
+      const data = await readJson<ChatSuccessBody>(res);
+
+      if (!data) {
+        throw new Error(
+          "ไม่สามารถอ่านคำตอบจาก INNOVERA AI ได้"
         );
       }
 
@@ -175,8 +255,6 @@ export default function ChatInterface({
           content: data.message,
         },
       ]);
-
-      await loadConversations();
     } catch (error) {
       const errorMessage =
         error instanceof Error
@@ -194,6 +272,10 @@ export default function ChatInterface({
       ]);
     } finally {
       setLoading(false);
+
+      // Always resync: on failure the server may have rolled the turn back, so the
+      // sidebar must reflect server truth rather than the optimistic update.
+      void loadConversations();
     }
   }
 
@@ -361,7 +443,9 @@ export default function ChatInterface({
                     void sendMessage()
                   }
                   disabled={
-                    loading || !input.trim()
+                    loading ||
+                    loadingHistory ||
+                    !input.trim()
                   }
                   className="rounded-lg bg-white px-5 py-2 font-medium text-black disabled:cursor-not-allowed disabled:opacity-40"
                 >

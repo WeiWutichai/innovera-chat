@@ -206,11 +206,22 @@ It performs, failing closed at every step:
 | 1 | Validate required configuration (names only, never values) | stop |
 | 2 | Start and await the database | stop |
 | 3 | **Verified backup** — must produce a NEW `.verified` marker | stop, before migrating |
-| 4 | Build runner + migrator from the same source | stop |
-| 5 | **Migrate** (one-shot container, before the app is replaced) | **stop — see below** |
-| 6 | Recreate the application (**interruption starts**) | — |
-| 7 | Bounded `/live` then `/ready` polls | roll back |
-| 8 | Landing page, static asset, signed-out API smoke | roll back |
+| 4 | **Record the rollback target** — the running image's immutable id, and retain that image under a tag so it cannot be garbage-collected | stop |
+| 5 | Build runner + migrator from the same source | stop |
+| 6 | **Migrate** (one-shot container, before the app is replaced) | **stop — see below** |
+| 7 | Recreate the application (**interruption starts**) | — |
+| 8 | Bounded `/live` then `/ready` polls | roll back |
+| 9 | Landing page, static asset, signed-out API smoke | roll back |
+
+Step 4 runs **before** anything is rebuilt or replaced, and does two things. It records the
+`sha256` image id of the container currently serving — a tag would be useless, because the
+build in step 5 moves the release tag onto the new image. It also re-tags that image as
+`innovera-chat-runner:rollback-previous`. The tag is a **lifetime anchor only**: once the
+release tag moves and the old container is replaced, the previous image is untagged and
+unreferenced, and the container runtime's image garbage collection is free to delete it —
+observed under Docker's containerd image store, where the rollback target was already gone
+by the time a rollback was attempted. Rollback still resolves through the recorded digest,
+never through this tag.
 
 A **deployment lock** (atomic `mkdir`, not `flock` — absent on macOS) makes a second
 concurrent deployment fail cleanly. The lock is released on every exit path while
@@ -240,8 +251,13 @@ serving — verified by container id before and after.
 ## 7. Application rollback is **not** database rollback
 
 ```
-bash scripts/rollback.sh <previous-image-tag>
+bash scripts/rollback.sh                 # use the target recorded by deploy.sh (preferred)
+bash scripts/rollback.sh <sha256:...>    # explicit immutable image id
 ```
+
+It takes an **immutable image id, never a tag**, and refuses anything that is not a
+`sha256:` value — rolling back "to the tag" would redeploy the very revision being rolled
+back from.
 
 Stops the failed application, starts the recorded previous image, re-runs the `/live`,
 `/ready` and smoke gates. It **never** touches the database: it contains no
@@ -293,7 +309,8 @@ These have **not** been performed. They are required before the first real deplo
 - [ ] **Confirm NGINX sends no Content-Security-Policy** before the application ever adds
       one — two policies are enforced as an intersection and would break Clerk sign-in.
 - [ ] **First ADMIN exists** (see §9) — there is no in-app path to create one.
-- [ ] **Rollback target recorded** — the currently running image id, before deploying.
+- [ ] **Rollback target recorded** — the currently running image id, before deploying,
+      and that image retained under a tag so image garbage collection cannot remove it.
 
 ## 11. NGINX / TLS expectations
 

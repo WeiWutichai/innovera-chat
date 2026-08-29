@@ -195,6 +195,7 @@ step "4/9 record the rollback target (BEFORE anything is rebuilt or replaced)"
 # being rolled back from. The digest cannot be moved.
 # ---------------------------------------------------------------------------
 ROLLBACK_FILE="${DEPLOY_ROLLBACK_FILE:-.deploy-rollback}"
+ROLLBACK_TAG="${DEPLOY_ROLLBACK_TAG:-innovera-chat-runner:rollback-previous}"
 app_container="$(${COMPOSE} ps -q chat-app 2>/dev/null | head -1 || true)"
 
 if [ -n "${app_container}" ]; then
@@ -202,12 +203,32 @@ if [ -n "${app_container}" ]; then
   if [ -z "${previous_image_id}" ]; then
     fail "an application container exists but its image ID could not be read — refusing to deploy without a rollback target"
   fi
+
+  # RETAIN the image, not just its digest.
+  #
+  # Recording the digest is necessary but NOT sufficient. The build in step 5 moves the
+  # release tag onto the new image, which leaves this one untagged; once its container is
+  # replaced in step 7 nothing references it, and an untagged unreferenced image is
+  # eligible for the container runtime's image garbage collection. (Observed under Docker
+  # with the containerd image store: the previous image was gone by the time a rollback
+  # was attempted.) Rollback then fails closed — correct, but unable to restore service.
+  #
+  # A retention tag keeps exactly ONE previous image resident: the immediately previous
+  # one, which is the only revision this rollback contract supports. The tag is a
+  # LIFETIME anchor only — rollback still resolves through the immutable digest recorded
+  # below, never through this mutable tag.
+  if ! docker tag "${previous_image_id}" "${ROLLBACK_TAG}" 2>/dev/null; then
+    fail "could not retain the previous image as ${ROLLBACK_TAG} — refusing to deploy without a rollback target that is guaranteed to still exist"
+  fi
+
   {
     printf 'image_id=%s\n' "${previous_image_id}"
     printf 'container_id=%s\n' "${app_container}"
+    printf 'retained_tag=%s\n' "${ROLLBACK_TAG}"
     printf 'recorded_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "${ROLLBACK_FILE}"
   echo "  rollback target: ${previous_image_id}"
+  echo "  retained as:     ${ROLLBACK_TAG} (prevents garbage collection; rollback still uses the digest)"
 else
   {
     printf 'image_id=none\n'

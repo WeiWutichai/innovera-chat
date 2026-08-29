@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readdirSync, utimesSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, utimesSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -409,5 +409,146 @@ describe("G. stale deployment lock", () => {
       "-ciE", String.raw`-mmin|-mtime|older[ _-]than|stale.*(seconds|minutes|hours)|LOCK_TIMEOUT`, DEPLOY,
     ]).catch(() => ({ stdout: "0" }));
     expect(Number(stdout.trim())).toBe(0);
+  });
+});
+
+describe("rollback target retention", () => {
+  // Recording the digest is not enough on its own. The step-5 build moves the release tag
+  // onto the NEW image, leaving the previous one untagged; once its container is replaced
+  // nothing references it and the runtime's image GC may delete it. Rollback then fails
+  // closed — correct, but unable to restore service. deploy.sh therefore also retains the
+  // image under a tag. These tests stub docker and compose so they never touch a daemon.
+  function stubs(tagSucceeds: boolean) {
+    const bin = path.join(work, "bin");
+    mkdirSync(bin, { recursive: true });
+
+    writeFileSync(
+      path.join(bin, "docker"),
+      [
+        "#!/usr/bin/env bash",
+        'if [ "$1" = "inspect" ]; then echo "sha256:aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999"; exit 0; fi',
+        `if [ "$1" = "tag" ]; then exit ${tagSucceeds ? 0 : 1}; fi`,
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+
+    const compose = path.join(work, "compose-stub");
+    writeFileSync(
+      compose,
+      [
+        "#!/usr/bin/env bash",
+        // `ps -q chat-app` must report a running application, otherwise deploy.sh takes
+        // the "no previous container" path and never reaches the retention step.
+        'for a in "$@"; do if [ "$a" = "ps" ]; then echo "fake-container-id"; exit 0; fi; done',
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+
+    const backup = path.join(work, "backup-stub");
+    writeFileSync(
+      backup,
+      [
+        "#!/usr/bin/env bash",
+        'mkdir -p "${BACKUP_DIR}"',
+        'printf archive > "${BACKUP_DIR}/stub.dump"',
+        'touch "${BACKUP_DIR}/stub.dump.verified"',
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+
+    return fullEnv({
+      PATH: `${bin}:${process.env.PATH}`,
+      DEPLOY_COMPOSE: compose,
+      BACKUP_SCRIPT: backup,
+      // The run is only expected to reach step 4; bound the later health polls so the
+      // test fails fast instead of waiting out the default 60s gates.
+      DEPLOY_LIVE_TIMEOUT: "1",
+      DEPLOY_APP_URL: "http://127.0.0.1:1",
+    });
+  }
+
+  it("retains the previous image under a tag and records it", async () => {
+    const env = stubs(true);
+    await runDeploy(env);
+
+    const meta = readFileSync(path.join(work, "rollback-meta"), "utf8");
+    expect(meta).toMatch(/^image_id=sha256:[0-9a-f]{64}$/m);
+    expect(meta).toMatch(/^retained_tag=.+$/m);
+  });
+
+  it("honours DEPLOY_ROLLBACK_TAG", async () => {
+    const env = stubs(true);
+    env.DEPLOY_ROLLBACK_TAG = "innovera-chat-runner:custom-retention";
+    await runDeploy(env);
+
+    const meta = readFileSync(path.join(work, "rollback-meta"), "utf8");
+    expect(meta).toContain("retained_tag=innovera-chat-runner:custom-retention");
+  });
+
+  it("refuses to deploy when the previous image cannot be retained", async () => {
+    // Failing closed matters: continuing would replace the application while leaving a
+    // rollback target that image GC is free to delete.
+    const res = await runDeploy(stubs(false));
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/could not retain the previous image/i);
+    expect(res.stdout).not.toMatch(/5\/9 build images/);
+  });
+
+  it("invents no rollback target — and retains nothing — on a first deployment", async () => {
+    // With no application container there is no previous release. Retention must not run
+    // at all: tagging something arbitrary here would manufacture a rollback target that
+    // points at the wrong revision.
+    const bin = path.join(work, "bin");
+    mkdirSync(bin, { recursive: true });
+    const calls = path.join(work, "docker-calls");
+
+    writeFileSync(
+      path.join(bin, "docker"),
+      ["#!/usr/bin/env bash", `echo "$@" >> "${calls}"`, "exit 0"].join("\n"),
+      { mode: 0o755 }
+    );
+
+    // `ps -q chat-app` prints nothing: the "no previous container" path.
+    const compose = path.join(work, "compose-empty");
+    writeFileSync(compose, ["#!/usr/bin/env bash", "exit 0"].join("\n"), { mode: 0o755 });
+
+    const backup = path.join(work, "backup-stub2");
+    writeFileSync(
+      backup,
+      [
+        "#!/usr/bin/env bash",
+        'mkdir -p "${BACKUP_DIR}"',
+        'printf archive > "${BACKUP_DIR}/stub.dump"',
+        'touch "${BACKUP_DIR}/stub.dump.verified"',
+      ].join("\n"),
+      { mode: 0o755 }
+    );
+
+    await runDeploy(
+      fullEnv({
+        PATH: `${bin}:${process.env.PATH}`,
+        DEPLOY_COMPOSE: compose,
+        BACKUP_SCRIPT: backup,
+        DEPLOY_LIVE_TIMEOUT: "1",
+        DEPLOY_APP_URL: "http://127.0.0.1:1",
+      })
+    );
+
+    const meta = readFileSync(path.join(work, "rollback-meta"), "utf8");
+    expect(meta).toContain("image_id=none");
+    expect(meta).not.toMatch(/retained_tag=/);
+
+    const invoked = existsSync(calls) ? readFileSync(calls, "utf8") : "";
+    expect(invoked).not.toMatch(/^tag /m);
+  });
+
+  it("resolves rollback through the digest, never the retention tag", async () => {
+    // The tag is a lifetime anchor only. rollback.sh must still reject a tag as a target.
+    const rollback = readFileSync(ROLLBACK, "utf8");
+    expect(rollback).toMatch(/not an immutable image ID/);
+    expect(rollback).not.toMatch(/rollback-previous/);
   });
 });

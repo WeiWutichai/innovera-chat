@@ -126,10 +126,34 @@ describe("security headers", () => {
     expect(res.headers.get("strict-transport-security")).toBeNull();
   });
 
-  it("does NOT send a CSP in this phase", async () => {
-    // A second CSP from NGINX would be enforced as an intersection and break Clerk.
+  it("sends CSP in REPORT-ONLY mode, not enforcing", async () => {
+    // Phase 3F ships observation only. Enforcing stays off until the policy has been
+    // validated in a real browser; NGINX was confirmed to send no CSP of its own, so
+    // there is no intersection to worry about.
     const res = await fetch(url("/api/health/live"));
+
+    expect(res.headers.get("content-security-policy-report-only")).toContain("default-src 'self'");
     expect(res.headers.get("content-security-policy")).toBeNull();
+  });
+
+  it("marks API responses no-store", async () => {
+    const res = await fetch(url("/api/health/live"));
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("does NOT mark static assets no-store", async () => {
+    // /_next/static must keep its immutable caching. Fetch the real asset the landing
+    // page references rather than guessing a path.
+    const page = await fetch(url("/"));
+    const html = await page.text();
+    const asset = html.match(/\/_next\/static\/[^"']+?\.(?:css|js)/)?.[0];
+
+    expect(asset).toBeTruthy();
+
+    const res = await fetch(url(asset!));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).not.toBe("no-store");
+    expect(res.headers.get("cache-control") ?? "").toContain("immutable");
   });
 
   it("applies headers to page routes as well as API routes", async () => {
@@ -188,5 +212,36 @@ describe("client disconnect", () => {
     // Proves Next fired request.signal AND that it propagated to the outbound fetch.
     expect(server.log()).toMatch(/PROBE abort_fired_after_ms=\d+/);
     expect(upstream.lastRequest()?.abortedByCaller).toBe(true);
+  });
+});
+
+describe("serving runtime contains no build-time tooling", () => {
+  /**
+   * The Dockerfile's runner stage copies `.next/standalone` (plus static and public) and
+   * nothing else, so what this suite builds IS what the serving image ships. Asserting
+   * here catches a regression — a stray import pulling the Prisma CLI into the traced
+   * graph — without needing Docker in the test path.
+   *
+   * npm audit reports HIGH advisories against deepmerge-ts, reached only through
+   * @prisma/config -> prisma (the CLI). @prisma/client declares the CLI as a production
+   * dependency, so this is NOT dev-only in the dependency graph; it is excluded from the
+   * serving image purely by file tracing, which is exactly what this test locks in.
+   */
+  const standalone = () => path.join(project.root, ".next/standalone/node_modules");
+
+  it.each(["prisma", "@prisma/config", "deepmerge-ts"])(
+    "does not ship %s in the standalone server output",
+    (pkg) => {
+      expect(existsSync(path.join(standalone(), pkg))).toBe(false);
+    }
+  );
+
+  it("does ship the Prisma client the application actually needs", () => {
+    expect(existsSync(path.join(standalone(), "@prisma/client"))).toBe(true);
+    expect(existsSync(path.join(standalone(), ".prisma"))).toBe(true);
+  });
+
+  it("ships no Prisma CLI binary", () => {
+    expect(existsSync(path.join(standalone(), ".bin/prisma"))).toBe(false);
   });
 });

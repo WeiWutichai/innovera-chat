@@ -11,9 +11,14 @@ import { checkDailyQuota } from "@/lib/usage-quota";
 import { selectContextWithinBudget } from "@/lib/context-window";
 import { logInfo, logWarn, logError } from "@/lib/log";
 
+// conversationId is bounded so an oversized value is rejected with a 400 before any
+// database work. Prisma parameterises, so this is not an injection guard — it stops a
+// multi-megabyte string being carried into a query. Real ids are cuid-shaped (~25 chars).
+const CONVERSATION_ID_MAX_LENGTH = 64;
+
 const chatRequestSchema = z.object({
   message: z.string().trim().min(1).max(chatConfig.maxMessageLength),
-  conversationId: z.string().nullish(),
+  conversationId: z.string().max(CONVERSATION_ID_MAX_LENGTH).nullish(),
 });
 
 type ChatCompletion = {
@@ -51,15 +56,57 @@ function messageForUpstreamStatus(status: number) {
   return status === 429 ? UPSTREAM_BUSY : UPSTREAM_UNAVAILABLE;
 }
 
+/**
+ * The configured canonical origin, or null when none is set.
+ *
+ * `configured` distinguishes "not set" (fall back to the legacy comparison) from "set
+ * but unusable" (fail closed). Collapsing those two would mean a typo in the variable
+ * silently downgrades the check instead of stopping the request.
+ */
+function canonicalOrigin(): { configured: boolean; origin: string | null } {
+  const raw = process.env.APP_CANONICAL_ORIGIN?.trim();
+
+  if (!raw) {
+    return { configured: false, origin: null };
+  }
+
+  try {
+    const url = new URL(raw);
+
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      return { configured: true, origin: null };
+    }
+
+    // URL.origin normalises: it drops any path, query, trailing slash and default port,
+    // so "https://host/" and "https://host" compare equal.
+    return { configured: true, origin: url.origin };
+  } catch {
+    return { configured: true, origin: null };
+  }
+}
+
 // The Clerk session cookie rides along on any cross-site POST, so without this a page
 // on another origin could spend a signed-in user's quota. Sec-Fetch-Site is the primary
-// check because it needs no server configuration; the Origin/Host comparison is only a
+// check because it needs no server configuration; the Origin comparison is only a
 // fallback for clients that do not send it.
+//
+// The fallback never trusts X-Forwarded-Host. That header is supplied by the client,
+// NGINX does not set it, and comparing Origin against it let an attacker satisfy the
+// check with two headers they control. When APP_CANONICAL_ORIGIN is set the Origin is
+// compared against that fixed value; otherwise against the Host header only.
 function isCrossSiteRequest(req: Request) {
   const site = req.headers.get("sec-fetch-site");
 
   if (site) {
     return site !== "same-origin" && site !== "none";
+  }
+
+  const canonical = canonicalOrigin();
+
+  // Explicitly configured but unparseable. Refuse rather than fall back to a weaker
+  // check the operator did not choose.
+  if (canonical.configured && !canonical.origin) {
+    return true;
   }
 
   const origin = req.headers.get("origin");
@@ -68,8 +115,15 @@ function isCrossSiteRequest(req: Request) {
     return false;
   }
 
-  const host =
-    req.headers.get("x-forwarded-host") ?? req.headers.get("host");
+  if (canonical.origin) {
+    try {
+      return new URL(origin).origin !== canonical.origin;
+    } catch {
+      return true;
+    }
+  }
+
+  const host = req.headers.get("host");
 
   if (!host) {
     return false;

@@ -342,7 +342,74 @@ never a routine consequence of an application problem. See §4 for the restore c
 | --- | --- |
 | `Strict-Transport-Security` | **NGINX.** It terminates TLS; the app is reached over plain HTTP on loopback and cannot know whether the client used TLS. |
 | `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options`, `Permissions-Policy` | **Application** (`next.config.ts`). |
-| `Content-Security-Policy` | **Neither, for now.** Browsers enforce the intersection of every CSP received, so a second policy from NGINX would silently break Clerk sign-in. Adding one requires confirming NGINX sends none, then a `Report-Only` period. |
+| `Content-Security-Policy` | **Application**, currently `Report-Only`. NGINX was confirmed to send no `add_header` at all, so there is no intersection risk. See §8.1. |
+| `Cache-Control: no-store` | **Application**, scoped to `/api/:path*` only. Static assets keep immutable caching. |
+
+
+### 8.1 Content-Security-Policy lifecycle
+
+The policy is built in `next.config.ts`. The Clerk origin is **derived from the
+publishable key**, not hardcoded: Clerk encodes its Frontend API host in the key
+(`pk_<env>_<base64>` decoding to `"<host>$"`), which is exactly how `@clerk/shared`
+resolves it and where `clerk.browser.js` is loaded from. The policy therefore always
+matches the key baked into the bundle.
+
+```
+REPORT-ONLY  ──▶  browser validation  ──▶  ENFORCING  ──▶  public-launch gate
+  (now)            (sign-in, chat,          CSP_ENFORCE=1     HIGH finding closed
+                    streaming, admin)       + rebuild
+```
+
+**The HIGH finding this addresses remains OPEN until enforcing mode is live.**
+`Report-Only` observes and reports; it blocks nothing.
+
+Validation before promoting — exercise each in a real browser with the console open and
+confirm no violation is reported:
+
+- Clerk sign-in, sign-up, and sign-out
+- an authenticated chat turn, including streaming
+- the admin panel
+- avatar images and any Clerk bot-protection challenge
+
+Two `'unsafe-inline'` allowances are present and are **structural, not shortcuts**:
+
+- `script-src` — Next.js 16 emits the streaming RSC payload as bare inline `<script>`
+  blocks with no nonce and no hash (verified in this repository's build output:
+  `(self.__next_f=self.__next_f||[]).push(...)`). Removing it requires nonce propagation
+  through middleware, which is the prerequisite for enforcing mode.
+- `style-src` — the build emits inline `style="..."` attributes, which cannot carry a
+  nonce.
+
+`'unsafe-eval'` is deliberately **absent**. If Report-Only shows a need for it, treat
+that as a finding to review rather than a directive to add.
+
+Promotion is `CSP_ENFORCE=1`. Next resolves `headers()` at **build time** into the routes
+manifest, so this is a rebuild-and-redeploy — not a runtime toggle on a live container.
+
+`Cross-Origin-Opener-Policy` and `Cross-Origin-Resource-Policy` were evaluated and
+**deliberately not enabled**. Both can interfere with Clerk's popup and redirect sign-in
+flows, and that cannot be verified without a real Clerk instance in a browser. They are
+deferred to a later hardening phase rather than enabled untested.
+
+### 8.2 `APP_CANONICAL_ORIGIN`
+
+The chat API's cross-site check uses `Sec-Fetch-Site` as its primary signal. When a
+client omits that header, the fallback compares the request `Origin` against a fixed
+canonical origin.
+
+**`APP_CANONICAL_ORIGIN` MUST be explicitly configured before public production launch.**
+Set it to the exact public origin, e.g. `https://chat.ai.innovera.co.th`.
+
+| State | Behaviour |
+| --- | --- |
+| Set and valid | `Origin` is compared against it. `Host` and `X-Forwarded-Host` are ignored entirely. |
+| Set but unparseable, or a non-http(s) scheme | **Fails closed** — the request is refused. A typo must not silently downgrade the check. |
+| Unset | Falls back to comparing `Origin` against the `Host` header. Acceptable for local and test use only. |
+
+The fallback never reads `X-Forwarded-Host`. That header is supplied by the client and
+NGINX does not set it, so comparing `Origin` against it allowed an attacker to satisfy
+the check using two headers they controlled.
+
 
 ---
 
@@ -354,6 +421,21 @@ Losing every ADMIN is recoverable only the same way, which is why the applicatio
 to disable or demote the last active administrator.
 
 ---
+
+### Rate limiting and replica count
+
+Application rate limiting, concurrency slots and quota accounting are **per-process and
+in-memory** (`src/lib/rate-limiter.ts`). That is correct for the documented
+single-replica topology and nothing else.
+
+**Scaling to more than one replica requires a shared-state rate limiter first.** With two
+replicas the effective limit silently doubles and concurrency caps stop binding. Limits
+also reset on every deployment, since the process restarts.
+
+There is **no edge or IP-level rate limiting**. Every application limit keys on the
+authenticated user, so it only engages after sign-in; unauthenticated request volume is
+unbounded. Adding `limit_req_zone` / `limit_req` in NGINX is a **public-launch gate**,
+deliberately excluded from application code.
 
 ## 10. Production deployment checklist — BLOCKERS
 
@@ -370,6 +452,17 @@ These have **not** been performed. They are required before the first real deplo
 - [ ] **First ADMIN exists** (see §9) — there is no in-app path to create one.
 - [ ] **Rollback target recorded** — the currently running image id, before deploying,
       and that image retained under a tag so image garbage collection cannot remove it.
+
+### Public-launch gates (in addition to the above)
+
+- [ ] **DNS** — `chat.ai.innovera.co.th` resolves to the production address at the authority.
+- [ ] **TLS** — certificate issued and HTTPS validated end to end.
+- [ ] **`APP_CANONICAL_ORIGIN`** configured to the public origin (§8.2).
+- [ ] **CSP promoted** from `Report-Only` to enforcing after browser validation (§8.1).
+- [ ] **NGINX edge/IP rate limiting** implemented and validated.
+- [ ] **Clerk sign-in / sign-out** tested through the real HTTPS hostname.
+- [ ] **Authenticated chat streaming** tested through the real HTTPS hostname.
+- [ ] **Final port/exposure verification** — 3002 loopback only, database unpublished.
 
 ## 11. NGINX / TLS expectations
 

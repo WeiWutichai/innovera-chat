@@ -157,7 +157,7 @@ describe("F. backup gate", () => {
     writeFileSync(failing, "#!/usr/bin/env bash\necho 'simulated backup failure' >&2\nexit 1\n");
     await run("chmod", ["+x", failing]);
 
-    const res = await runDeploy(fullEnv({ BACKUP_SCRIPT: failing }));
+    const res = await runDeploy({ ...writeStubs(work).env, BACKUP_SCRIPT: failing });
 
     expect(res.code).not.toBe(0);
     expect(res.stderr).toMatch(/backup script failed/i);
@@ -170,7 +170,7 @@ describe("F. backup gate", () => {
     writeFileSync(hollow, "#!/usr/bin/env bash\nmkdir -p \"$BACKUP_DIR\"\ntouch \"$BACKUP_DIR/x.dump\"\nexit 0\n");
     await run("chmod", ["+x", hollow]);
 
-    const res = await runDeploy(fullEnv({ BACKUP_SCRIPT: hollow }));
+    const res = await runDeploy({ ...writeStubs(work).env, BACKUP_SCRIPT: hollow });
 
     expect(res.code).not.toBe(0);
     expect(res.stderr).toMatch(/no \.verified marker produced/i);
@@ -181,12 +181,13 @@ describe("F. backup gate", () => {
     mkdirSync(backups, { recursive: true });
     writeFileSync(path.join(backups, "old.dump"), "archive");
     writeFileSync(path.join(backups, "old.dump.verified"), "");
+    // BACKUP_DIR must stay pointed at the pre-seeded directory above.
 
     const noop = path.join(work, "noop-backup.sh");
     writeFileSync(noop, "#!/usr/bin/env bash\nexit 0\n");
     await run("chmod", ["+x", noop]);
 
-    const res = await runDeploy(fullEnv({ BACKUP_SCRIPT: noop }));
+    const res = await runDeploy({ ...writeStubs(work).env, BACKUP_SCRIPT: noop });
 
     expect(res.code).not.toBe(0);
     expect(res.stderr).toMatch(/no NEW verified backup/i);
@@ -412,61 +413,323 @@ describe("G. stale deployment lock", () => {
   });
 });
 
+
+/**
+ * Stub `docker` and `docker compose` so these tests never touch a daemon.
+ *
+ * The docker stub answers `inspect --format ...` from fixture env vars, matching on the
+ * FORMAT STRING rather than argument position, because deploy.sh calls inspect both ways
+ * (`inspect <id> --format <fmt>` and `inspect --format <fmt> <id>`).
+ */
+function writeStubs(
+  work: string,
+  opts: {
+    dbId?: string;          // "" => no database container exists
+    appId?: string;         // "" => no application container (first deployment)
+    running?: string;
+    health?: string;
+    mount?: string;
+    ports?: string;
+    networks?: string;
+    pgReadyRc?: number;
+    psqlRc?: number;
+    tagRc?: number;
+  } = {}
+) {
+  const o = {
+    dbId: "db-container-id",
+    appId: "",
+    running: "true",
+    health: "healthy",
+    mount: "volume:innovera-chat_chat_postgres_data",
+    ports: "",
+    networks: "innovera-chat_default ",
+    pgReadyRc: 0,
+    psqlRc: 0,
+    tagRc: 0,
+    ...opts,
+  };
+
+  const bin = path.join(work, "bin");
+  mkdirSync(bin, { recursive: true });
+  const calls = path.join(work, "docker-calls");
+
+  writeFileSync(
+    path.join(bin, "docker"),
+    [
+      "#!/usr/bin/env bash",
+      `echo "$@" >> "${calls}"`,
+      'cmd="$1"; shift',
+      'fmt=""; for a in "$@"; do case "$a" in *"{{"*) fmt="$a";; esac; done',
+      'case "$cmd" in',
+      "  inspect)",
+      '    case "$fmt" in',
+      `      *State.Running*)  printf '%s\\n' "\${FIX_RUNNING}";;`,
+      `      *State.Health*)   printf '%s\\n' "\${FIX_HEALTH}";;`,
+      `      *Destination*)    printf '%s\\n' "\${FIX_MOUNT}";;`,
+      `      *PortBindings*)   printf '%s\\n' "\${FIX_PORTS}";;`,
+      `      *Networks*)       printf '%s\\n' "\${FIX_NETWORKS}";;`,
+      `      *State.Status*)   printf '%s\\n' "exited";;`,
+      "      *.Image*)         echo 'sha256:aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999';;",
+      "      *) echo '';;",
+      "    esac",
+      "    ;;",
+      '  exec)',
+      '    for a in "$@"; do',
+      '      case "$a" in',
+      `        pg_isready) exit \${FIX_PGREADY};;`,
+      `        psql)       exit \${FIX_PSQL};;`,
+      "      esac",
+      "    done",
+      "    exit 0;;",
+      `  tag)   exit \${FIX_TAGRC};;`,
+      "  image) exit 0;;",
+      "esac",
+      "exit 0",
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+
+  const compose = path.join(work, "compose-stub");
+  writeFileSync(
+    compose,
+    [
+      "#!/usr/bin/env bash",
+      `echo "$@" >> "${path.join(work, "compose-calls")}"`,
+      'args="$*"',
+      'case "$args" in',
+      `  *"ps -aq chat-db"*) [ -n "\${FIX_DB_ID}" ] && echo "\${FIX_DB_ID}"; exit 0;;`,
+      `  *"ps -q chat-app"*) [ -n "\${FIX_APP_ID}" ] && echo "\${FIX_APP_ID}"; exit 0;;`,
+      "esac",
+      "exit 0",
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+
+  const backup = path.join(work, "backup-stub");
+  writeFileSync(
+    backup,
+    [
+      "#!/usr/bin/env bash",
+      'mkdir -p "${BACKUP_DIR}"',
+      'printf archive > "${BACKUP_DIR}/stub.dump"',
+      'touch "${BACKUP_DIR}/stub.dump.verified"',
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+
+  const env = fullEnv({
+    PATH: `${bin}:${process.env.PATH}`,
+    DEPLOY_COMPOSE: compose,
+    BACKUP_SCRIPT: backup,
+    DEPLOY_LIVE_TIMEOUT: "1",
+    DEPLOY_APP_URL: "http://127.0.0.1:1",
+    FIX_DB_ID: o.dbId,
+    FIX_APP_ID: o.appId,
+    FIX_RUNNING: o.running,
+    FIX_HEALTH: o.health,
+    FIX_MOUNT: o.mount,
+    FIX_PORTS: o.ports,
+    FIX_NETWORKS: o.networks,
+    FIX_PGREADY: String(o.pgReadyRc),
+    FIX_PSQL: String(o.psqlRc),
+    FIX_TAGRC: String(o.tagRc),
+  });
+
+  return { env, calls, composeCalls: path.join(work, "compose-calls") };
+}
+
+function readCalls(f: string) {
+  return existsSync(f) ? readFileSync(f, "utf8") : "";
+}
+
+describe("database validation — a normal deploy never creates or restarts the database", () => {
+  // The production defect this guards: `docker compose up -d chat-db` CONVERGES, so a
+  // changed service definition recreated the live PostgreSQL container as a side effect
+  // of deploying the application.
+
+  it("A. existing healthy database: never runs compose up/run against it, and continues", async () => {
+    const { env, composeCalls } = writeStubs(work);
+    const res = await runDeploy(env);
+
+    const compose = readCalls(composeCalls);
+    // The ONLY compose verb allowed against chat-db is the read-only `ps`.
+    expect(compose).toMatch(/ps -aq chat-db/);
+    expect(compose).not.toMatch(/up .*chat-db/);
+    expect(compose).not.toMatch(/restart .*chat-db/);
+    expect(compose).not.toMatch(/start .*chat-db/);
+    // and it got past step 2
+    expect(res.stdout).toMatch(/database validated in place/);
+    expect(res.stdout).toMatch(/not started, not restarted, not recreated/);
+  });
+
+  it("B. existing STOPPED database: fails closed and never starts it", async () => {
+    const { env, composeCalls } = writeStubs(work, { running: "false" });
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/exists but is not running/i);
+    expect(res.stderr).toMatch(/will NOT start it/i);
+    expect(readCalls(composeCalls)).not.toMatch(/up .*chat-db/);
+    expect(res.stdout).not.toMatch(/3\/9 verified backup/);
+  });
+
+  it("C. existing UNHEALTHY database: fails closed", async () => {
+    const { env, composeCalls } = writeStubs(work, { health: "unhealthy" });
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/reports health 'unhealthy'/i);
+    expect(readCalls(composeCalls)).not.toMatch(/up .*chat-db/);
+  });
+
+  it("D. database ABSENT: normal deploy fails closed and creates no empty database", async () => {
+    const { env, composeCalls } = writeStubs(work, { dbId: "" });
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/no chat-db container exists/i);
+    expect(res.stderr).toMatch(/bootstrap-db\.sh/);
+    // the whole point: nothing was created
+    expect(readCalls(composeCalls)).not.toMatch(/up .*chat-db/);
+  });
+
+  it("E. wrong named volume: fails closed", async () => {
+    const { env } = writeStubs(work, { mount: "volume:some-other-volume" });
+    env.DEPLOY_DB_VOLUME = "innovera-chat_chat_postgres_data";
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/not the expected 'innovera-chat_chat_postgres_data'/);
+  });
+
+  it("E2. missing or anonymous data mount: fails closed", async () => {
+    const missing = await runDeploy(writeStubs(work, { mount: "" }).env);
+    expect(missing.code).not.toBe(0);
+    expect(missing.stderr).toMatch(/no mount at \/var\/lib\/postgresql\/data/i);
+
+    rmSync(work, { recursive: true, force: true });
+    work = mkdtempSync(path.join(os.tmpdir(), "p3c-scripts-"));
+    const bind = await runDeploy(writeStubs(work, { mount: "bind:" }).env);
+    expect(bind.code).not.toBe(0);
+    expect(bind.stderr).toMatch(/not a named volume/i);
+  });
+
+  it("F. database publishing a host port: fails closed", async () => {
+    const { env } = writeStubs(work, { ports: "5432/tcp " });
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/publishes host port/i);
+  });
+
+  it("G. database attached to the shared AI network: fails closed", async () => {
+    const { env } = writeStubs(work, {
+      networks: "innovera-chat_default innovera_default ",
+    });
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/attached to the shared AI network/i);
+  });
+
+  it("G2. database missing the expected private network: fails closed", async () => {
+    const { env } = writeStubs(work, { networks: "some-other-net " });
+    env.DEPLOY_DB_NETWORK = "innovera-chat_default";
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/not attached to the expected private network/i);
+  });
+
+  it("H. healthy database with readiness succeeding: step 2 passes", async () => {
+    const { env } = writeStubs(work);
+    const res = await runDeploy(env);
+
+    expect(res.stdout).toMatch(/2\/9 database validation/);
+    expect(res.stdout).toMatch(/database validated in place/);
+    expect(res.stdout).toMatch(/3\/9 verified backup/);
+  });
+
+  it("readiness failure does not trigger a restart", async () => {
+    const { env, composeCalls } = writeStubs(work, { pgReadyRc: 1 });
+    env.DEPLOY_DB_READY_ATTEMPTS = "1";
+    const res = await runDeploy(env);
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/did not report ready/i);
+    expect(res.stderr).toMatch(/NOT restarted or recreated/i);
+    expect(readCalls(composeCalls)).not.toMatch(/up .*chat-db/);
+  });
+
+  it("migrator and app replacement use --no-deps so compose cannot converge chat-db", async () => {
+    // Without --no-deps, `compose run`/`up` start depends_on services, which would
+    // recreate the database at step 6 or 7 instead of step 2 — same bug, later.
+    const deploy = readFileSync(DEPLOY, "utf8");
+    const runLine = deploy.split("\n").find((l) => l.includes("run --rm") && !l.trim().startsWith("#"));
+    const upLine = deploy.split("\n").find((l) => l.includes("up -d") && l.includes("chat-app") && !l.trim().startsWith("#"));
+    expect(runLine).toContain("--no-deps");
+    expect(upLine).toContain("--no-deps");
+
+    const rollback = readFileSync(ROLLBACK, "utf8");
+    const rbLine = rollback.split("\n").find((l) => l.includes("up -d") && !l.trim().startsWith("#"));
+    expect(rbLine).toContain("--no-deps");
+  });
+
+  it("deploy.sh contains no executable `compose up` against chat-db", async () => {
+    const code = readFileSync(DEPLOY, "utf8")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("#"))
+      .join("\n");
+    expect(code).not.toMatch(/up -d chat-db/);
+  });
+});
+
+describe("explicit database bootstrap", () => {
+  const BOOTSTRAP = path.join(REPO, "scripts/bootstrap-db.sh");
+
+  it("refuses to adopt, restart or repair an existing database", async () => {
+    const { env } = writeStubs(work, { dbId: "already-here" });
+    try {
+      await run("bash", [BOOTSTRAP], { env, cwd: REPO });
+      throw new Error("expected bootstrap to fail");
+    } catch (e) {
+      const err = e as { code?: number; stderr?: string };
+      expect(err.code).not.toBe(0);
+      expect(err.stderr).toMatch(/already exists/i);
+      expect(err.stderr).toMatch(/will not adopt, restart, or repair/i);
+    }
+  });
+
+  it("creates the database only when none exists", async () => {
+    const { env, composeCalls } = writeStubs(work, { dbId: "" });
+    // compose stub reports nothing on the first `ps`, so bootstrap proceeds to `up`.
+    await run("bash", [BOOTSTRAP], { env, cwd: REPO }).catch(() => undefined);
+    expect(readCalls(composeCalls)).toMatch(/up -d chat-db/);
+  });
+
+  it("never runs migrations or restores data", async () => {
+    const src = readFileSync(BOOTSTRAP, "utf8")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("#"))
+      .join("\n");
+    expect(src).not.toMatch(/prisma|migrate deploy|pg_restore|DROP DATABASE/);
+  });
+});
+
 describe("rollback target retention", () => {
   // Recording the digest is not enough on its own. The step-5 build moves the release tag
   // onto the NEW image, leaving the previous one untagged; once its container is replaced
   // nothing references it and the runtime's image GC may delete it. Rollback then fails
   // closed — correct, but unable to restore service. deploy.sh therefore also retains the
   // image under a tag. These tests stub docker and compose so they never touch a daemon.
+  // Delegates to the shared stub builder so these tests exercise the SAME step-2
+  // database validation the deployment now performs.
   function stubs(tagSucceeds: boolean) {
-    const bin = path.join(work, "bin");
-    mkdirSync(bin, { recursive: true });
-
-    writeFileSync(
-      path.join(bin, "docker"),
-      [
-        "#!/usr/bin/env bash",
-        'if [ "$1" = "inspect" ]; then echo "sha256:aaaabbbbccccddddeeeeffff0000111122223333444455556666777788889999"; exit 0; fi',
-        `if [ "$1" = "tag" ]; then exit ${tagSucceeds ? 0 : 1}; fi`,
-        "exit 0",
-      ].join("\n"),
-      { mode: 0o755 }
-    );
-
-    const compose = path.join(work, "compose-stub");
-    writeFileSync(
-      compose,
-      [
-        "#!/usr/bin/env bash",
-        // `ps -q chat-app` must report a running application, otherwise deploy.sh takes
-        // the "no previous container" path and never reaches the retention step.
-        'for a in "$@"; do if [ "$a" = "ps" ]; then echo "fake-container-id"; exit 0; fi; done',
-        "exit 0",
-      ].join("\n"),
-      { mode: 0o755 }
-    );
-
-    const backup = path.join(work, "backup-stub");
-    writeFileSync(
-      backup,
-      [
-        "#!/usr/bin/env bash",
-        'mkdir -p "${BACKUP_DIR}"',
-        'printf archive > "${BACKUP_DIR}/stub.dump"',
-        'touch "${BACKUP_DIR}/stub.dump.verified"',
-      ].join("\n"),
-      { mode: 0o755 }
-    );
-
-    return fullEnv({
-      PATH: `${bin}:${process.env.PATH}`,
-      DEPLOY_COMPOSE: compose,
-      BACKUP_SCRIPT: backup,
-      // The run is only expected to reach step 4; bound the later health polls so the
-      // test fails fast instead of waiting out the default 60s gates.
-      DEPLOY_LIVE_TIMEOUT: "1",
-      DEPLOY_APP_URL: "http://127.0.0.1:1",
-    });
+    return writeStubs(work, {
+      appId: "fake-container-id",
+      tagRc: tagSucceeds ? 0 : 1,
+    }).env;
   }
 
   it("retains the previous image under a tag and records it", async () => {
@@ -498,51 +761,17 @@ describe("rollback target retention", () => {
   });
 
   it("invents no rollback target — and retains nothing — on a first deployment", async () => {
-    // With no application container there is no previous release. Retention must not run
-    // at all: tagging something arbitrary here would manufacture a rollback target that
-    // points at the wrong revision.
-    const bin = path.join(work, "bin");
-    mkdirSync(bin, { recursive: true });
-    const calls = path.join(work, "docker-calls");
+    // With a healthy database but NO application container there is no previous release.
+    // Retention must not run at all: tagging something arbitrary here would manufacture a
+    // rollback target pointing at the wrong revision.
+    const { env, calls } = writeStubs(work, { appId: "" });
 
-    writeFileSync(
-      path.join(bin, "docker"),
-      ["#!/usr/bin/env bash", `echo "$@" >> "${calls}"`, "exit 0"].join("\n"),
-      { mode: 0o755 }
-    );
-
-    // `ps -q chat-app` prints nothing: the "no previous container" path.
-    const compose = path.join(work, "compose-empty");
-    writeFileSync(compose, ["#!/usr/bin/env bash", "exit 0"].join("\n"), { mode: 0o755 });
-
-    const backup = path.join(work, "backup-stub2");
-    writeFileSync(
-      backup,
-      [
-        "#!/usr/bin/env bash",
-        'mkdir -p "${BACKUP_DIR}"',
-        'printf archive > "${BACKUP_DIR}/stub.dump"',
-        'touch "${BACKUP_DIR}/stub.dump.verified"',
-      ].join("\n"),
-      { mode: 0o755 }
-    );
-
-    await runDeploy(
-      fullEnv({
-        PATH: `${bin}:${process.env.PATH}`,
-        DEPLOY_COMPOSE: compose,
-        BACKUP_SCRIPT: backup,
-        DEPLOY_LIVE_TIMEOUT: "1",
-        DEPLOY_APP_URL: "http://127.0.0.1:1",
-      })
-    );
+    await runDeploy(env);
 
     const meta = readFileSync(path.join(work, "rollback-meta"), "utf8");
     expect(meta).toContain("image_id=none");
     expect(meta).not.toMatch(/retained_tag=/);
-
-    const invoked = existsSync(calls) ? readFileSync(calls, "utf8") : "";
-    expect(invoked).not.toMatch(/^tag /m);
+    expect(readCalls(calls)).not.toMatch(/^tag /m);
   });
 
   it("resolves rollback through the digest, never the retention tag", async () => {

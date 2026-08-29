@@ -75,6 +75,15 @@ prefill cost, latency and KV-cache pressure — not model capability.
 
 ---
 
+### Database validation overrides
+
+| Variable | Effect |
+| --- | --- |
+| `DEPLOY_DB_VOLUME` | Require this exact named volume on `chat-db` |
+| `DEPLOY_DB_NETWORK` | Require `chat-db` to be attached to this private network |
+| `AI_NETWORK_NAME` | The shared AI network `chat-db` must **not** be on (default `innovera_default`) |
+| `DEPLOY_DB_READY_ATTEMPTS` | Readiness polls, 2s apart, for an already-running database (default 30) |
+
 ## 3. Test requirements before any deployment
 
 All of the following must pass on the exact commit being deployed:
@@ -204,7 +213,7 @@ It performs, failing closed at every step:
 | Step | Action | On failure |
 | --- | --- | --- |
 | 1 | Validate required configuration (names only, never values) | stop |
-| 2 | Start and await the database | stop |
+| 2 | **Validate the already-running database, read-only** — never starts, restarts or creates it | stop |
 | 3 | **Verified backup** — must produce a NEW `.verified` marker | stop, before migrating |
 | 4 | **Record the rollback target** — the running image's immutable id, and retain that image under a tag so it cannot be garbage-collected | stop |
 | 5 | Build runner + migrator from the same source | stop |
@@ -212,6 +221,56 @@ It performs, failing closed at every step:
 | 7 | Recreate the application (**interruption starts**) | — |
 | 8 | Bounded `/live` then `/ready` polls | roll back |
 | 9 | Landing page, static asset, signed-out API smoke | roll back |
+
+### The deployment never touches the database container
+
+**A normal deployment does not start, restart, recreate or create PostgreSQL.** Step 2
+validates an existing database read-only and stops if it cannot.
+
+This is not caution for its own sake — it fixes an observed production incident. Step 2
+used to run `docker compose up -d chat-db`. Compose **converges**: when a service
+definition differs from the running container's, `up` *recreates* that container. The
+first production deployment that carried a changed compose file therefore restarted live
+PostgreSQL as a side effect of deploying the *application*. The data survived only
+because the named volume did, and every in-flight query failed during the gap.
+
+`--no-deps` on the migrator `run` and on both application `up` commands (deploy and
+rollback) closes the same hole one step later: `compose run` and `compose up` start
+`depends_on` services by default, so without it they would converge `chat-db` at step 6
+or 7 instead. Step 2 has already proved the database is up and healthy, so nothing is
+lost by not waiting on the dependency condition.
+
+What step 2 verifies before allowing a deployment to continue:
+
+| Check | Why it fails closed |
+| --- | --- |
+| A `chat-db` container exists | Creating one here would start an **empty** database and then migrate into it — the app would come up healthy serving no data |
+| It is running | A database that stopped unexpectedly must be understood by an operator; starting it could resume a half-shut-down instance |
+| Health is `healthy` (or no healthcheck is defined) | Never migrate against a database that reports unhealthy |
+| `/var/lib/postgresql/data` is a **named** volume | An anonymous or missing mount means the data does not survive a recreate |
+| The volume matches `DEPLOY_DB_VOLUME`, when set | Guards against deploying at the wrong database |
+| No host port is published | The database must be reachable only from the private chat network |
+| It is **not** on the shared AI network | Otherwise everything on that network can reach the database |
+| It is on `DEPLOY_DB_NETWORK`, when set | Confirms the expected private network |
+| `pg_isready` and a `SELECT 1` succeed | Readiness is polled, never repaired |
+
+If any check fails the deployment stops **before** the backup, migration and replacement
+steps. It never attempts a fix: a stopped, unhealthy or missing database is an incident,
+not a deployment step.
+
+### Bootstrap is a separate, explicit operation
+
+```
+bash scripts/bootstrap-db.sh
+```
+
+Creating database infrastructure is deliberate and separately approved. `bootstrap-db.sh`
+refuses to run if a `chat-db` container already exists — it **creates**, it never adopts,
+restarts or repairs. It runs no migrations and restores no data; the deployment runs
+migrations, and restoring is a manual decision (§4).
+
+The two are kept apart so the only way to end up with an empty production database is to
+ask for one explicitly.
 
 Step 4 runs **before** anything is rebuilt or replaced, and does two things. It records the
 `sha256` image id of the container currently serving — a tag would be useless, because the

@@ -23,7 +23,7 @@
 #   scripts/rollback.sh                 # use the recorded rollback target (preferred)
 #   scripts/rollback.sh <image-id>      # explicit immutable image ID override
 
-set -euo pipefail
+set -Eeuo pipefail
 
 COMPOSE="${DEPLOY_COMPOSE:-docker compose}"
 APP_URL="${DEPLOY_APP_URL:-http://127.0.0.1:3002}"
@@ -93,7 +93,9 @@ step "2/4 start the previously recorded image"
 echo "  immutable target: ${PREVIOUS_IMAGE}"
 # APP_IMAGE (not IMAGE_TAG) is used so a full immutable image ID can be passed. The tag
 # form `name:${IMAGE_TAG}` cannot express a digest.
-APP_IMAGE="${PREVIOUS_IMAGE}" ${COMPOSE} up -d --force-recreate --no-build chat-app \
+# --no-deps: a rollback must replace ONLY the application. Without it, `up` would
+# converge chat-db too and could recreate the database mid-incident.
+APP_IMAGE="${PREVIOUS_IMAGE}" ${COMPOSE} up -d --no-deps --force-recreate --no-build chat-app \
   || fail "could not start the previous image"
 
 started_image="$(docker inspect --format '{{.Image}}' "$(${COMPOSE} ps -q chat-app | head -1)" 2>/dev/null || true)"

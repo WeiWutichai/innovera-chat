@@ -38,9 +38,9 @@ export default async function AdminPage() {
         </div>
       </header>
 
-      <section className="mx-auto max-w-7xl p-8">
-        <div className="overflow-hidden rounded-2xl border border-white/10">
-          <table className="w-full text-left text-sm">
+      <section className="mx-auto max-w-7xl p-4 sm:p-8">
+        <div className="overflow-x-auto rounded-2xl border border-white/10">
+          <table className="w-full min-w-[40rem] text-left text-sm">
             <thead className="bg-white/5 text-white/50">
               <tr>
                 <th className="p-4">User</th>

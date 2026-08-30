@@ -513,6 +513,10 @@ function writeStubs(
       "#!/usr/bin/env bash",
       'mkdir -p "${BACKUP_DIR}"',
       'printf archive > "${BACKUP_DIR}/stub.dump"',
+      // The real backup.sh writes a manifest declaring scope, and deploy.sh refuses to
+      // migrate without one. The stub models that, or it would be testing a contract
+      // the production script no longer has.
+      'printf "backup_scope=complete\\n" > "${BACKUP_DIR}/stub.manifest"',
       'touch "${BACKUP_DIR}/stub.dump.verified"',
     ].join("\n"),
     { mode: 0o755 }
@@ -779,5 +783,160 @@ describe("rollback target retention", () => {
     const rollback = readFileSync(ROLLBACK, "utf8");
     expect(rollback).toMatch(/not an immutable image ID/);
     expect(rollback).not.toMatch(/rollback-previous/);
+  });
+});
+
+describe("M1 file volume does not weaken the Phase 3E database guards", () => {
+  const compose = () => readFileSync(path.join(REPO, "docker-compose.yml"), "utf8");
+
+  /** The body of one compose service, up to the next top-level service or key. */
+  function serviceBlock(name: string): string {
+    const src = compose();
+    const start = src.indexOf(`  ${name}:`);
+    if (start < 0) throw new Error(`no service ${name}`);
+    const rest = src.slice(start + 1);
+    const nextIdx = rest.search(/\n {2}[a-z-]+:\n|\nvolumes:|\nnetworks:/);
+    return rest.slice(0, nextIdx < 0 ? undefined : nextIdx);
+  }
+
+  it("mounts the file volume on chat-app", () => {
+    expect(serviceBlock("chat-app")).toContain("chat_file_storage:/data/files");
+  });
+
+  it("does NOT mount the file volume on chat-db", () => {
+    // Sharing the volume would put the database and the blobs in one failure domain,
+    // and a compromise of either would reach the other.
+    expect(serviceBlock("chat-db")).not.toContain("chat_file_storage");
+  });
+
+  it("leaves chat-db's data volume untouched", () => {
+    expect(serviceBlock("chat-db")).toContain("chat_postgres_data:/var/lib/postgresql/data");
+  });
+
+  it("declares the file volume at the top level", () => {
+    expect(compose()).toMatch(/^volumes:[\s\S]*chat_file_storage:/m);
+  });
+
+  it("still validates the database read-only, with no start or restart", () => {
+    // The Phase 3E contract. Adding a volume must not have reintroduced convergence.
+    const deploy = readFileSync(DEPLOY, "utf8")
+      .split("\n")
+      .filter((l) => !l.trim().startsWith("#"))
+      .join("\n");
+
+    expect(deploy).not.toMatch(/up -d chat-db/);
+    expect(deploy).toMatch(/ps -aq chat-db/);
+    expect(deploy).toContain("database validated in place");
+  });
+
+  it("still passes --no-deps everywhere compose could converge chat-db", () => {
+    const deploy = readFileSync(DEPLOY, "utf8").split("\n").filter((l) => !l.trim().startsWith("#"));
+
+    const runLine = deploy.find((l) => l.includes("run --rm"));
+    const upLine = deploy.find((l) => l.includes("up -d") && l.includes("chat-app"));
+
+    expect(runLine).toContain("--no-deps");
+    expect(upLine).toContain("--no-deps");
+  });
+
+  it("still guards the database volume and network identity", () => {
+    const deploy = readFileSync(DEPLOY, "utf8");
+
+    expect(deploy).toContain("DEPLOY_DB_VOLUME");
+    expect(deploy).toContain("DEPLOY_DB_NETWORK");
+    expect(deploy).toMatch(/publishes host port/);
+    expect(deploy).toMatch(/shared AI network/);
+  });
+
+  it("creates the mount point owned by the runtime user in the image", () => {
+    // Docker seeds an empty named volume from the image path INCLUDING ownership. If the
+    // directory is not created as node, the volume is root-owned and uid 1000 cannot
+    // write — a failure that appears only in production, never in a dev run.
+    const dockerfile = readFileSync(path.join(REPO, "Dockerfile"), "utf8");
+
+    expect(dockerfile).toMatch(/mkdir -p \/data\/files && chown node:node \/data\/files/);
+    expect(dockerfile.indexOf("chown node:node /data/files")).toBeLessThan(
+      dockerfile.indexOf("USER node")
+    );
+  });
+});
+
+describe("a production deployment cannot use a database-only backup", () => {
+  /**
+   * Once file storage holds data, a PostgreSQL dump alone restores File rows with no
+   * bytes behind them — a backup that reports success and has silently lost every
+   * upload. These tests prove the deployment refuses that combination before migrating.
+   */
+  // Reuses the shared stub builder so docker/compose behave exactly as they do for the
+  // other deployment tests; only the backup-mode variables differ.
+  const stubbedDeployEnv = (overrides: Record<string, string> = {}) => ({
+    ...writeStubs(work, { appId: "fake-container-id" }).env,
+    ...overrides,
+  });
+
+  it("REFUSES when BACKUP_FILES=0", async () => {
+    const res = await runDeploy(stubbedDeployEnv({ BACKUP_FILES: "0" }));
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/cannot use a database-only backup/i);
+    // Refused before the backup step even runs.
+    expect(res.stdout).not.toMatch(/3\/9 verified backup/);
+  });
+
+  it("REFUSES when BACKUP_ALLOW_DB_ONLY is set, even with BACKUP_FILES=1", async () => {
+    // The legacy escape hatch must not be reachable from a deployment by any route.
+    const res = await runDeploy(
+      stubbedDeployEnv({ BACKUP_FILES: "1", BACKUP_ALLOW_DB_ONLY: "1" })
+    );
+
+    expect(res.code).not.toBe(0);
+    expect(res.stderr).toMatch(/cannot use a database-only backup/i);
+  });
+
+  it("names both variables in the refusal so the cause is unambiguous", async () => {
+    const res = await runDeploy(stubbedDeployEnv({ BACKUP_FILES: "0" }));
+
+    expect(res.stderr).toContain("BACKUP_FILES=0");
+    expect(res.stderr).toMatch(/BACKUP_ALLOW_DB_ONLY/);
+    expect(res.stderr).toMatch(/not be recoverable/i);
+  });
+
+  it("requires the backup manifest to declare scope=complete", async () => {
+    // Even with the flags unset, the deployment verifies what the backup actually
+    // produced rather than trusting the .verified marker alone.
+    const deploy = readFileSync(DEPLOY, "utf8");
+
+    expect(deploy).toContain("backup_scope=");
+    expect(deploy).toMatch(/scope.*!=.*"complete"/);
+    expect(deploy).toMatch(/Refusing to migrate/);
+  });
+});
+
+describe("backup.sh requires two flags to skip file capture", () => {
+  it("refuses BACKUP_FILES=0 without the acknowledgement flag", async () => {
+    const backup = path.join(REPO, "scripts/backup.sh");
+
+    try {
+      await run("bash", [backup], {
+        env: fullEnv({
+          BACKUP_FILES: "0",
+          BACKUP_DIR: path.join(work, "backups"),
+          CHAT_POSTGRES_USER: "nobody",
+          CHAT_POSTGRES_DB: "nothing",
+          BACKUP_EXEC: "true",
+        }),
+        cwd: REPO,
+      });
+      throw new Error("expected refusal");
+    } catch (e) {
+      const err = e as { code?: number; stderr?: string };
+      expect(err.code).not.toBe(0);
+      expect(err.stderr).toMatch(/requires BACKUP_ALLOW_DB_ONLY=1/);
+    }
+  });
+
+  it("explains what a database-only backup does not protect", () => {
+    const backup = readFileSync(path.join(REPO, "scripts/backup.sh"), "utf8");
+    expect(backup).toMatch(/does NOT restore uploaded files/);
   });
 });

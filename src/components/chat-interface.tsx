@@ -475,6 +475,13 @@ export default function ChatInterface({
           )}
         </div>
 
+        <Link
+          href="/files"
+          className="mt-4 flex min-h-11 items-center rounded-xl border border-white/10 px-4 py-3 text-sm hover:bg-white/5"
+        >
+          Files
+        </Link>
+
         {isAdmin && (
           <Link
             href="/admin"

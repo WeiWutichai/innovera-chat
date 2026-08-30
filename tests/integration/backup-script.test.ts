@@ -33,6 +33,15 @@ beforeAll(() => {
     CHAT_POSTGRES_USER: decodeURIComponent(url.username),
     CHAT_POSTGRES_DB: url.pathname.replace(/^\//, ""),
     BACKUP_EXEC: "",
+    // This suite exercises the POSTGRESQL half of the backup. File-storage capture
+    // needs a running chat-app container to tar the volume from, which does not exist
+    // here; the file half has its own suite in backup-file-storage.test.ts, including
+    // the fail-closed path. Disabling it explicitly keeps these tests testing what they
+    // were written to test.
+    BACKUP_FILES: "0",
+    // Skipping file capture now requires an explicit acknowledgement that the
+    // result is INCOMPLETE. A normal deployment refuses this path entirely.
+    BACKUP_ALLOW_DB_ONLY: "1",
   };
 });
 
@@ -229,9 +238,15 @@ describe("live writes during a backup", () => {
   }, 120_000);
 
   it("never claims equality with the live database", async () => {
-    const { stdout } = await run("grep", ["-ci", "mismatch", "scripts/backup.sh"])
-      .catch(() => ({ stdout: "0" }));
-    expect(Number(stdout.trim())).toBe(0);
+    // Behaviour, not prose: comments are stripped first. The script's commentary
+    // legitimately uses "mismatched" when describing correlated backup halves, which
+    // has nothing to do with comparing row counts against a moving source.
+    const code = readFileSync(path.join(process.cwd(), "scripts/backup.sh"), "utf8")
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("#"))
+      .join("\n");
+
+    expect(code.toLowerCase()).not.toContain("mismatch");
   });
 });
 

@@ -144,6 +144,19 @@ for var in ${REQUIRED_BUILD_VARS}; do
     fail "missing required build-time configuration: ${var}"
   fi
 done
+# A production deployment may NOT produce a database-only backup.
+#
+# Once file storage holds data, a PostgreSQL dump alone restores File rows with no bytes
+# behind them — a backup that reports success and has silently lost every upload.
+#
+# scripts/backup.sh already requires TWO flags to skip file capture; this refuses if
+# EITHER is present, so the legacy path cannot be reached from a deployment even by
+# accident. Checked in step 1 because it is a configuration error: failing here costs
+# nothing and states the cause plainly, rather than surfacing later as a backup problem.
+if [ "${BACKUP_FILES:-1}" != "1" ] || [ -n "${BACKUP_ALLOW_DB_ONLY:-}" ]; then
+  fail "a production deployment cannot use a database-only backup (BACKUP_FILES=${BACKUP_FILES:-1}, BACKUP_ALLOW_DB_ONLY=${BACKUP_ALLOW_DB_ONLY:-unset}). Uploaded files would not be recoverable. Unset both and retry."
+fi
+
 echo "  all required variables present (names checked, values never printed)"
 
 # ---------------------------------------------------------------------------
@@ -274,7 +287,21 @@ after_count=$(count_verified)
 
 archive="${newest_verified%.verified}"
 [ -s "${archive}" ] || fail "verified marker present but archive is missing or empty: ${archive}"
+
+# The .verified marker alone no longer means the backup is complete. Confirm the manifest
+# the backup just wrote actually claims both halves, so a deployment can never proceed on
+# a backup that omits file storage.
+manifest="${archive%.dump}.manifest"
+[ -f "${manifest}" ] || fail "backup produced no manifest — cannot confirm the backup is complete"
+
+scope="$(grep -E '^backup_scope=' "${manifest}" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+
+if [ "${scope}" != "complete" ]; then
+  fail "the backup reports scope '${scope:-unknown}', not 'complete'. Uploaded files are not covered, so this backup cannot protect a deployment. Refusing to migrate."
+fi
+
 echo "  verified backup: ${archive}"
+echo "  scope:           complete (database + file storage)"
 
 # ---------------------------------------------------------------------------
 step "4/9 record the rollback target (BEFORE anything is rebuilt or replaced)"

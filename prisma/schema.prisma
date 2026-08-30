@@ -25,43 +25,44 @@ enum MessageRole {
 }
 
 model User {
-  id              String         @id @default(cuid())
-  clerkUserId     String         @unique
-  email           String         @unique
+  id              String     @id @default(cuid())
+  clerkUserId     String     @unique
+  email           String     @unique
   name            String?
-  role            UserRole       @default(USER)
-  status          UserStatus     @default(PENDING)
-  dailyTokenLimit Int            @default(50000)
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
+  role            UserRole   @default(USER)
+  status          UserStatus @default(PENDING)
+  dailyTokenLimit Int        @default(50000)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
 
-  conversations   Conversation[]
-  usages          Usage[]
+  conversations Conversation[]
+  usages        Usage[]
+  files         File[]
 }
 
 model Conversation {
-  id        String    @id @default(cuid())
+  id        String   @id @default(cuid())
   title     String?
   userId    String
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  messages  Message[]
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages Message[]
 
   @@index([userId])
 }
 
 model Message {
-  id             String       @id @default(cuid())
+  id             String      @id @default(cuid())
   conversationId String
   role           MessageRole
   content        String
   promptTokens   Int?
   outputTokens   Int?
-  createdAt      DateTime     @default(now())
+  createdAt      DateTime    @default(now())
 
-  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   @@index([conversationId])
 }
@@ -75,11 +76,47 @@ model Usage {
   requestCount     Int      @default(1)
   createdAt        DateTime @default(now())
 
-  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Serves the daily-quota aggregate (sum totalTokens where userId + createdAt >= dayStart),
   // which runs on every chat request. The former standalone @@index([userId]) was a strict
   // left-prefix of this composite and has been dropped as redundant.
   @@index([userId, createdAt])
   @@index([createdAt])
+}
+
+enum FileExtractStatus {
+  PENDING
+  SKIPPED
+}
+
+model File {
+  id     String @id @default(cuid())
+  userId String
+
+  // Server-generated, opaque, and never derived from the uploaded filename. Unique so a
+  // key collision surfaces as a constraint violation rather than a silent overwrite of
+  // another user's bytes.
+  storageKey String @unique
+
+  // Display only. Sanitised on write; never used to build a filesystem path.
+  filename String
+
+  // Sniffed from the bytes, never taken from the client's Content-Type header.
+  mimeType String
+
+  sizeBytes Int
+  checksum  String
+
+  // M1 stores and serves; it never parses. SKIPPED records that decision explicitly so
+  // a later extraction milestone can find the backlog, and so the UI can state plainly
+  // that content was not read rather than implying an empty result.
+  extractStatus FileExtractStatus @default(SKIPPED)
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Serves the owner-scoped list (the only read path in M1) and the quota aggregate.
+  @@index([userId, createdAt])
 }

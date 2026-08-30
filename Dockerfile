@@ -72,6 +72,15 @@ COPY --from=builder --chown=node:node /app/.next/standalone ./
 COPY --from=builder --chown=node:node /app/.next/static ./.next/static
 COPY --from=builder --chown=node:node /app/public ./public
 
+# Uploaded file storage mount point.
+#
+# This must exist in the IMAGE, owned by node, before the volume is mounted. Docker
+# seeds an empty named volume from the image's directory — including its ownership — on
+# first use. Without this the volume is created root-owned and the runner, which is
+# uid 1000, cannot write to it: uploads fail with EACCES only in production, never in a
+# dev run where no volume is mounted.
+RUN mkdir -p /data/files && chown node:node /data/files
+
 USER node
 
 EXPOSE 3000

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import {
   checkRateLimit,
+  checkUploadRateLimit,
   acquireSlot,
   createSlotRelease,
   releaseSlot,
@@ -11,6 +12,13 @@ import {
 
 const T0 = 1_800_000_000_000; // fixed epoch: results are deterministic
 const LIMIT = 10;
+
+/**
+ * Internal keys are namespaced per bucket ("chat:alice") so uploads get their own
+ * window. These tests assert eviction and compaction behaviour, not the key format, so
+ * they address the map through this helper.
+ */
+const chatKey = (userId: string) => `chat:${userId}`;
 
 beforeEach(() => __resetLimiters());
 
@@ -27,7 +35,7 @@ describe("rolling window", () => {
 
   it("records rejected attempts rather than discarding them", () => {
     for (let i = 0; i < 12; i++) checkRateLimit("alice", LIMIT, T0 + i);
-    expect(__getCounters().attempts.get("alice")).toHaveLength(12);
+    expect(__getCounters().attempts.get(chatKey("alice"))).toHaveLength(12);
   });
 
   it("cannot be spun back under the limit by hammering", () => {
@@ -69,7 +77,7 @@ describe("stale key lifecycle", () => {
 
     __runSweep(T0 + 61_000);
 
-    expect([...__getCounters().attempts.keys()]).toEqual(["active"]);
+    expect([...__getCounters().attempts.keys()]).toEqual([chatKey("active")]);
   });
 
   it("evicts stale keys on the request path, with no timer involved", () => {
@@ -80,7 +88,7 @@ describe("stale key lifecycle", () => {
     // Another user's request triggers the amortised sweep.
     checkRateLimit("someone-else", LIMIT, T0 + 61_000);
 
-    expect([...__getCounters().attempts.keys()]).toEqual(["someone-else"]);
+    expect([...__getCounters().attempts.keys()]).toEqual([chatKey("someone-else")]);
   });
 
   it("is amortised rather than running on every request", () => {
@@ -97,7 +105,7 @@ describe("stale key lifecycle", () => {
 
     __runSweep(T0 + 61_000);
 
-    const live = __getCounters().attempts.get("mixed");
+    const live = __getCounters().attempts.get(chatKey("mixed"));
     expect(live).toHaveLength(1);
     expect(live?.[0]).toBe(T0 + 59_000);
   });
@@ -155,5 +163,26 @@ describe("sweep timer", () => {
     expect(created[0].hasRef()).toBe(false);
 
     created.forEach((timer) => clearInterval(timer));
+  });
+});
+
+describe("upload bucket isolation", () => {
+  it("does not consume the chat allowance", () => {
+    // Exhausting uploads must leave chat untouched; charging both to one window would
+    // let a large upload batch lock the user out of conversation entirely.
+    for (let i = 0; i < 30; i++) checkUploadRateLimit("bob", 20, T0 + i);
+
+    expect(checkUploadRateLimit("bob", 20, T0 + 40).allowed).toBe(false);
+    expect(checkRateLimit("bob", LIMIT, T0 + 41).allowed).toBe(true);
+  });
+
+  it("keeps a separate window per bucket", () => {
+    checkRateLimit("carol", LIMIT, T0);
+    checkUploadRateLimit("carol", 20, T0);
+
+    expect([...__getCounters().attempts.keys()].sort()).toEqual([
+      "chat:carol",
+      "upload:carol",
+    ]);
   });
 });

@@ -114,3 +114,20 @@ describe("robustness", () => {
     expect(spy).toHaveBeenCalled();
   });
 });
+
+describe("file workspace fields", () => {
+  it.each(["filename", "path", "diff", "code"])(
+    "redacts %s, which can itself carry sensitive information",
+    (field) => {
+      // "Q3-layoffs-draft.xlsx" leaks regardless of what the file contains.
+      expect(__redactForTest({ [field]: "Q3-layoffs-draft.xlsx" })[field]).toBe("[redacted]");
+    }
+  );
+
+  it("keeps the scalars the file events actually need", () => {
+    // Sizes, ids and counts are safe and are what the operational events are for.
+    expect(
+      __redactForTest({ sizeBytes: 1024, fileId: "abc123", mimeType: "text/plain" })
+    ).toEqual({ sizeBytes: 1024, fileId: "abc123", mimeType: "text/plain" });
+  });
+});

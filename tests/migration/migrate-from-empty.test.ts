@@ -58,6 +58,7 @@ describe("migrating from an empty database", () => {
     expect(applied.map((m) => m.migration_name)).toEqual([
       "20260827163847_init",
       "20260828104547_usage_userid_createdat_index",
+      "20260830120000_add_file_storage",
     ]);
   });
 
@@ -112,7 +113,8 @@ describe("referential integrity", () => {
       ORDER BY tc.table_name
     `);
 
-    expect(rules).toHaveLength(3);
+    // Four now: User<-Conversation, Conversation<-Message, User<-Usage, User<-File.
+    expect(rules).toHaveLength(4);
     for (const rule of rules) expect(rule.delete_rule).toBe("CASCADE");
   });
 
@@ -121,7 +123,12 @@ describe("referential integrity", () => {
       `SELECT typname FROM pg_type WHERE typtype = 'e' ORDER BY typname`
     );
 
-    expect(enums.map((e) => e.typname)).toEqual(["MessageRole", "UserRole", "UserStatus"]);
+    expect(enums.map((e) => e.typname)).toEqual([
+      "FileExtractStatus",
+      "MessageRole",
+      "UserRole",
+      "UserStatus",
+    ]);
   });
 });
 

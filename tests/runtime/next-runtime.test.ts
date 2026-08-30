@@ -245,3 +245,72 @@ describe("serving runtime contains no build-time tooling", () => {
     expect(existsSync(path.join(standalone(), ".bin/prisma"))).toBe(false);
   });
 });
+
+describe("file API through the real server", () => {
+  it("requires authentication for upload", async () => {
+    const form = new FormData();
+    form.append("files", new File([new Uint8Array([1, 2, 3])], "a.bin"));
+
+    const res = await fetch(url("/api/files"), {
+      method: "POST",
+      headers: { "sec-fetch-site": "same-origin" },
+      body: form,
+    });
+
+    // JSON 401, not an HTML 404 from auth.protect() — the same reason /api/chat is
+    // excluded from the proxy's protected routes.
+    expect(res.status).toBe(401);
+    expect(res.headers.get("content-type")).toMatch(/application\/json/);
+  });
+
+  it("requires authentication for listing", async () => {
+    const res = await fetch(url("/api/files"), { headers: { "sec-fetch-site": "same-origin" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects a cross-site upload before authentication", async () => {
+    const form = new FormData();
+    form.append("files", new File([new Uint8Array([1])], "a.bin"));
+
+    const res = await fetch(url("/api/files"), {
+      method: "POST",
+      headers: { "sec-fetch-site": "cross-site" },
+      body: form,
+    });
+
+    expect(res.status).toBe(403);
+  });
+
+  it("marks file API responses no-store", async () => {
+    const res = await fetch(url("/api/files"), { headers: { "sec-fetch-site": "same-origin" } });
+    expect(res.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("carries the standard security headers", async () => {
+    const res = await fetch(url("/api/files"), { headers: { "sec-fetch-site": "same-origin" } });
+
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-security-policy-report-only")).toContain("default-src 'self'");
+  });
+});
+
+describe("file storage code is traced into the standalone build", () => {
+  /**
+   * output: "standalone" ships only what Next's tracer follows. Prisma's engine already
+   * needed an explicit outputFileTracingIncludes entry for exactly this reason, and the
+   * failure mode is a container that builds cleanly and throws on first use.
+   */
+  const serverChunks = () => path.join(project.root, ".next/server");
+
+  it("includes the file route handlers", () => {
+    const appDir = path.join(project.root, ".next/server/app/api/files");
+    expect(existsSync(appDir)).toBe(true);
+  });
+
+  it("still ships no Prisma CLI", () => {
+    const standalone = path.join(project.root, ".next/standalone/node_modules");
+    expect(existsSync(path.join(standalone, "prisma"))).toBe(false);
+    expect(existsSync(path.join(standalone, "@prisma/client"))).toBe(true);
+    expect(existsSync(serverChunks())).toBe(true);
+  });
+});

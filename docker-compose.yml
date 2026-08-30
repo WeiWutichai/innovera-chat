@@ -93,6 +93,14 @@ services:
     env_file:
       - .env.local
 
+    # Uploaded file storage. Belongs to chat-app ONLY — chat-db must never mount it, or
+    # the database and the blobs share a failure domain and a compromise of one reaches
+    # the other. The runner executes as uid 1000 (`USER node`), so the volume must be
+    # writable by that uid; the entry below is created by Docker on first use and
+    # chowned by the init step in scripts/init-file-storage.sh.
+    volumes:
+      - chat_file_storage:/data/files
+
     depends_on:
       chat-db:
         condition: service_healthy
@@ -130,6 +138,10 @@ services:
 
 volumes:
   chat_postgres_data:
+  # Uploaded files. Mounted by chat-app only. Included in the backup procedure from M1
+  # onward — see DEPLOYMENT.md; a PostgreSQL-only backup is NOT a complete backup once
+  # this volume holds data.
+  chat_file_storage:
 
 networks:
   # chat-db deliberately has NO networks: key, so it stays on `default` only and the

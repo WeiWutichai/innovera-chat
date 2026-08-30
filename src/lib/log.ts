@@ -15,8 +15,12 @@ export type LogFields = Record<string, unknown>;
 const REDACTED = "[redacted]";
 
 // Field names that must never reach a log, whatever they contain.
+//
+// `filename`, `path`, `diff` and `code` were added for the file workspace: a filename
+// can itself carry sensitive information ("Q3-layoffs-draft.xlsx"), and a diff or code
+// fragment is user content by definition.
 const SENSITIVE_FIELD =
-  /(^|_|\.)(authorization|cookie|password|passwd|secret|token|apikey|api_key|key|credential|dsn|database_url|databaseurl|connection_string|email|prompt|completion|content|messages|answer|body)($|_|\.)/i;
+  /(^|_|\.)(authorization|cookie|password|passwd|secret|token|apikey|api_key|key|credential|dsn|database_url|databaseurl|connection_string|email|prompt|completion|content|messages|answer|body|filename|filepath|path|diff|code)($|_|\.)/i;
 
 // Credential-shaped values, caught even when the field name looks harmless.
 const SENSITIVE_VALUE =

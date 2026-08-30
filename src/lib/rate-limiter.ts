@@ -83,15 +83,22 @@ if (sweepTimer && typeof (sweepTimer as { unref?: () => void }).unref === "funct
 export function checkRateLimit(
   userId: string,
   limitPerMinute: number,
-  now: number = Date.now()
+  now: number = Date.now(),
+  bucket: string = "chat"
 ): { allowed: boolean; retryAfterSeconds: number } {
   maybeSweep(now);
 
+  // Namespaced so a second call site gets its OWN window rather than competing for the
+  // chat allowance. One 25 MB upload and one chat message are not equivalent work, so
+  // charging them to the same bucket would either throttle chat or under-protect
+  // uploads. The sweep, the timer and the eviction logic stay shared.
+  const key = `${bucket}:${userId}`;
+
   const cutoff = now - RATE_WINDOW_MS;
-  const recent = (attempts.get(userId) ?? []).filter((t) => t > cutoff);
+  const recent = (attempts.get(key) ?? []).filter((t) => t > cutoff);
 
   recent.push(now);
-  attempts.set(userId, recent);
+  attempts.set(key, recent);
 
   if (recent.length <= limitPerMinute) {
     return { allowed: true, retryAfterSeconds: 0 };
@@ -170,4 +177,16 @@ export function __resetLimiters() {
   attempts.clear();
   inFlight.clear();
   lastSweepAt = 0;
+}
+
+/**
+ * Upload limiter. A thin alias so call sites read clearly and the bucket name cannot be
+ * mistyped at a call site into silently sharing the chat window.
+ */
+export function checkUploadRateLimit(
+  userId: string,
+  limitPerMinute: number,
+  now: number = Date.now()
+) {
+  return checkRateLimit(userId, limitPerMinute, now, "upload");
 }

@@ -75,6 +75,72 @@ prefill cost, latency and KV-cache pressure — not model capability.
 
 ---
 
+### File storage configuration
+
+Every value is clamped to an absolute ceiling the environment cannot raise, so an
+operator typo degrades to something safe rather than creating an unbounded upload path.
+
+| Variable | Default | Ceiling |
+| --- | --- | --- |
+| `FILE_MAX_SIZE_MB` | 25 | 100 |
+| `FILE_MAX_PER_UPLOAD` | 10 | 50 |
+| `FILE_MAX_BATCH_MB` | 50 | 200 |
+| `FILE_STORAGE_QUOTA_MB` | 2048 | 51200 |
+| `FILE_UPLOADS_PER_MINUTE` | 20 | 120 |
+| `FILE_STORAGE_ROOT` | `/data/files` | — |
+
+Uploads use their own rate-limit bucket, separate from chat: one 25 MB upload and one
+chat message are not equivalent work, and charging them to the same window would either
+throttle conversation or under-protect uploads.
+
+The four limits are independent and all are enforced:
+
+- **25 MB** per individual file
+- **10 files** selected per batch
+- **50 MB** total accepted payload per request — this is the one that bounds peak memory
+- **2 GB** stored per user
+
+The aggregate cap matters because the first two alone permit 10 x 25 MB = 250 MB in a
+single request. Uploads are buffered to compare the declared size against the real bytes,
+so that is 250 MB in the heap of a single-replica container that is also serving AI
+generation. The batch cap is checked from declared sizes **before any file is read into
+memory and before any blob is written**.
+
+**NGINX note.** The chat vhost currently sets `client_max_body_size 10M`, which is below
+both `FILE_MAX_SIZE_MB` and `FILE_MAX_BATCH_MB`. Raising it is a separate, reviewed NGINX
+change scoped to the upload path, not applied globally.
+
+When it is raised, it must be set **above** `FILE_MAX_BATCH_MB`, not equal to it, and not
+merely to `FILE_MAX_SIZE_MB`. A multipart request carries boundary markers and per-part
+headers on top of the file bytes, so a 50 MB payload arrives as slightly more than 50 MB
+on the wire. Sizing NGINX exactly at the application limit would reject valid uploads at
+the proxy with a bare 413, before the application could return its own explanatory error.
+Roughly `FILE_MAX_BATCH_MB + 5M` is a reasonable margin.
+
+### Storage quota is concurrency-safe
+
+Admission is serialised per user by a PostgreSQL row lock taken inside the same
+transaction that measures usage and inserts the row:
+
+```
+BEGIN
+  SELECT id FROM "User" WHERE id = $1 FOR UPDATE   -- serialises this user only
+  SELECT SUM("sizeBytes") FROM "File" WHERE "userId" = $1
+  INSERT INTO "File" ...                            -- or reject
+COMMIT
+```
+
+Without it, two concurrent 25 MB uploads against 30 MB of remaining quota both observe
+30 MB free and both commit. The lock is on the **User** row, so different users never
+block each other.
+
+The blob is written to storage **before** this transaction opens. That ordering is
+deliberate: a row without a blob is a visible file whose download fails forever and which
+consumes quota, whereas a blob without a row is invisible, consumes no quota, and is
+reclaimable. A crash at any point can only produce the harmless kind — which is also why
+there is no reservation table, and therefore no expiry logic and no phantom reservations
+to reconcile.
+
 ### Database validation overrides
 
 | Variable | Effect |
@@ -152,6 +218,80 @@ since the archive. Restore is for corruption and unrecoverable migration failure
 for routine application rollback.
 
 ---
+
+### 4.1 File storage is part of the backup (M1 onward)
+
+**Once uploaded files exist, a PostgreSQL dump is no longer a complete backup.** The
+`File` rows would restore with no bytes behind them and every download would 404 — a
+restore that reports success and has silently lost user data.
+
+`scripts/backup.sh` therefore captures both halves under one timestamp:
+
+```
+innovera-chat-<id>.dump            PostgreSQL, custom format, restore-verified
+innovera-chat-<id>.files.tar.gz    file storage volume, tar.gz, readability-verified
+innovera-chat-<id>.manifest        correlation record + SHA-256 of both artefacts
+innovera-chat-<id>.dump.verified   written LAST, only when everything above succeeded
+```
+
+The ordering is deliberate. The file archive is written **after** the database has been
+proven restorable and **before** the `.verified` marker, so a file-storage failure fails
+the whole backup closed. A run that produced a verified database dump and no file
+archive would look complete and would not be.
+
+Skipping file capture requires **two** independent flags, and a production deployment
+cannot use that path at all:
+
+| Context | Behaviour |
+| --- | --- |
+| `BACKUP_FILES=0` alone | **Refused.** `backup.sh` exits with an explanation |
+| `BACKUP_FILES=0` + `BACKUP_ALLOW_DB_ONLY=1` | Allowed. Manifest records `backup_scope=database-only` |
+| Either flag set during `deploy.sh` | **Refused at step 1**, before anything migrates |
+| Manifest scope is not `complete` | `deploy.sh` refuses to migrate |
+
+One variable was too easy to set by accident — a stale export, a copied command line —
+and the consequence is a backup carrying the `.verified` marker while omitting every
+uploaded file. The second flag means a database-only backup can only be produced by
+someone who wrote down that they wanted one.
+
+The manifest's `backup_scope` field is what consumers should branch on: `complete`
+asserts both halves are present, `database-only` states plainly that they are not.
+
+| Variable | Purpose |
+| --- | --- |
+| `BACKUP_FILES` | `0` to skip file capture. Default `1` |
+| `BACKUP_FILES_EXEC` | How to reach the volume. Default `docker compose exec -T chat-app` |
+| `BACKUP_FILES_ROOT` | Storage root inside that container. Default `/data/files` |
+
+### 4.2 Restore rehearsal
+
+```
+CHAT_POSTGRES_USER=... bash scripts/restore-rehearsal.sh <backup-id>
+```
+
+Restores into a **scratch** database and a **scratch** directory — it never touches the
+production database or the production volume. It proves five things:
+
+1. the manifest exists and both recorded checksums still match the artefacts
+2. the database archive restores
+3. the file archive extracts
+4. **every `File` row has a corresponding blob**
+5. every blob's size matches the size recorded in the database
+
+Point 4 is the one that matters, and it is the check a database-only backup cannot pass.
+
+**Legacy backups remain restorable and are not retroactively marked corrupt.** A manifest
+written before `backup_scope` existed is reported as LEGACY and restores normally. A
+backup with no file archive and no `File` rows passes. One with no file archive but
+`File` rows present fails loudly as INCOMPLETE — the correct verdict, because that
+pairing genuinely cannot be fully restored. A manifest claiming `backup_scope=complete`
+while `files_enabled=0` is rejected as self-contradictory before anything is restored.
+
+### 4.3 Off-host copies must include both artefacts
+
+The Gate 3 procedure now covers three files per backup, not one: the `.dump`, the
+`.files.tar.gz` and the `.manifest`. Copying only the database archive off-host
+reproduces exactly the incompleteness this section exists to prevent.
 
 ## 5. Migrations run before the application
 

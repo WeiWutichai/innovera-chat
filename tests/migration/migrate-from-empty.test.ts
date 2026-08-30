@@ -59,6 +59,7 @@ describe("migrating from an empty database", () => {
       "20260827163847_init",
       "20260828104547_usage_userid_createdat_index",
       "20260830120000_add_file_storage",
+      "20260830140000_add_file_extraction",
     ]);
   });
 

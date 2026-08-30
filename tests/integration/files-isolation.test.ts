@@ -68,6 +68,29 @@ function blobCount(): number {
   return n;
 }
 
+/**
+ * Drives extraction to a terminal state.
+ *
+ * The upload route also fires its own background sweep, so a single explicit sweep()
+ * can race it: SKIP LOCKED means one of the two claims the row, and the test may read
+ * the row while the other is still parsing. Polling for a terminal status removes the
+ * race rather than papering over it with a sleep.
+ */
+async function extractToCompletion(fileId: string, attempts = 40) {
+  const { sweep } = await import("@/lib/extraction/queue");
+
+  for (let i = 0; i < attempts; i++) {
+    await sweep();
+
+    const row = await prisma.file.findUnique({ where: { id: fileId } });
+    if (row && !["PENDING", "PROCESSING"].includes(row.extractStatus)) return row;
+
+    await new Promise((r) => setTimeout(r, 25));
+  }
+
+  throw new Error("extraction did not reach a terminal state");
+}
+
 /** Uploads a file as A and returns its id. */
 async function fileOwnedByA(name = "secret.txt", content = "A private content"): Promise<string> {
   const res = await actingAs(A, () => uploadFiles(uploadRequest(name, content)));
@@ -301,5 +324,68 @@ describe("storage key isolation on disk", () => {
     const list = await (await actingAs(A, () => listFiles(fileRequest("")))).json();
     expect(list.files).toHaveLength(0);
     expect(planted).toBeTruthy();
+  });
+});
+
+describe("extraction metadata is owner-scoped", () => {
+  it("returns 404 when B reads A's extraction result", async () => {
+    const id = await fileOwnedByA("private.txt", "CONFIDENTIAL EXTRACTED BODY");
+
+    // Extract it so there is real content to leak.
+    await extractToCompletion(id);
+
+    const res = await actingAs(B, () => getFile(fileRequest(id), params(id)));
+
+    expect(res.status).toBe(404);
+    expect(await res.text()).not.toContain("CONFIDENTIAL");
+  });
+
+  it("gives the owner the extraction result and preview", async () => {
+    const id = await fileOwnedByA("mine.txt", "my extracted content");
+
+    await extractToCompletion(id);
+
+    const res = await actingAs(A, () => getFile(fileRequest(id), params(id)));
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(body.file.extractStatus).toBe("EXTRACTED");
+    expect(body.file.preview).toBe("my extracted content");
+  });
+
+  it("never exposes the storage key alongside the preview", async () => {
+    const id = await fileOwnedByA("a.txt", "content");
+
+    await extractToCompletion(id);
+
+    const res = await actingAs(A, () => getFile(fileRequest(id), params(id)));
+    expect(JSON.stringify(await res.json())).not.toContain("storageKey");
+  });
+
+  it("bounds the preview independently of the stored text", async () => {
+    // The stored text may be 400k characters; shipping that to a browser panel helps
+    // nobody and makes the metadata response enormous.
+    const big = "y".repeat(25_000);
+    const id = await fileOwnedByA("big.txt", big);
+
+    await extractToCompletion(id);
+
+    const body = await (await actingAs(A, () => getFile(fileRequest(id), params(id)))).json();
+
+    expect(body.file.preview.length).toBe(20_000);
+    expect(body.file.previewTruncated).toBe(true);
+    // The true length is still reported honestly.
+    expect(body.file.extractedChars).toBe(25_000);
+  });
+
+  it("does not extract another user's file as a side effect of a sweep", async () => {
+    // The sweep is global by design — it must still never surface B's content to A.
+    await actingAs(B, () => uploadFiles(uploadRequest("b-secret.txt", "B PRIVATE")));
+
+    const { sweep } = await import("@/lib/extraction/queue");
+    await sweep();
+
+    const aList = await (await actingAs(A, () => listFiles(fileRequest("")))).json();
+    expect(JSON.stringify(aList)).not.toContain("B PRIVATE");
   });
 });

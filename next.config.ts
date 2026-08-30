@@ -157,6 +157,13 @@ const nextConfig: NextConfig = {
     "/api/**/*": [
       "./node_modules/.prisma/client/**/*",
       "./node_modules/@prisma/client/**/*",
+      // Extraction parsers. Verified empirically: without these entries the standalone
+      // output contains neither package even though the .nft trace references them, so
+      // the image builds cleanly and throws on the first upload. unpdf is loaded with a
+      // dynamic import specifically so the PDF engine is not resident for text uploads,
+      // which puts it even further out of the tracer's static reach.
+      "./node_modules/fflate/**/*",
+      "./node_modules/unpdf/**/*",
     ],
   },
 

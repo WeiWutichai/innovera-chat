@@ -262,9 +262,26 @@ describe("archives and unknown binaries", () => {
 
     const row = await prisma.file.findFirstOrThrow();
     expect(row.mimeType).toBe("application/octet-stream");
-    // M1 never parses. SKIPPED records that explicitly rather than implying an empty
-    // extraction result.
-    expect(row.extractStatus).toBe("SKIPPED");
+
+    // Queued on upload, then resolved to UNSUPPORTED — "we deliberately did not read
+    // this", which is distinct from "we read it and found nothing".
+    //
+    // The intermediate PENDING/PROCESSING state is deliberately NOT asserted: the
+    // upload route fires its own background sweep, so whether the row has been claimed
+    // by the time this line runs is a genuine race. The terminal state is the contract.
+    const { sweep } = await import("@/lib/extraction/queue");
+
+    let after = row;
+    for (let i = 0; i < 40 && ["PENDING", "PROCESSING"].includes(after.extractStatus); i++) {
+      await sweep();
+      after = await prisma.file.findFirstOrThrow();
+      if (["PENDING", "PROCESSING"].includes(after.extractStatus)) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+
+    expect(after.extractStatus).toBe("UNSUPPORTED");
+    expect(after.extractReason).toMatch(/cannot be read/i);
   });
 });
 

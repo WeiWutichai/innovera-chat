@@ -17,6 +17,11 @@ export async function GET(
   // which is an enumeration oracle.
   if (!file) return Response.json({ error: "File not found" }, { status: 404 });
 
+  // The preview is bounded independently of what was extracted: the stored text may be
+  // 400k characters, and shipping that to a browser panel helps nobody.
+  const PREVIEW_CHARS = 20_000;
+  const text = file.extractedText ?? null;
+
   return Response.json({
     file: {
       id: file.id,
@@ -24,8 +29,18 @@ export async function GET(
       mimeType: file.mimeType,
       sizeBytes: file.sizeBytes,
       checksum: file.checksum,
-      extractStatus: file.extractStatus,
       createdAt: file.createdAt,
+
+      extractStatus: file.extractStatus,
+      extractReason: file.extractReason,
+      extractedChars: file.extractedChars,
+      extractTruncated: file.extractTruncated,
+      extractedAt: file.extractedAt,
+      units: file.extractUnits ?? null,
+      metadata: file.extractMetadata ?? null,
+
+      preview: text === null ? null : text.slice(0, PREVIEW_CHARS),
+      previewTruncated: text !== null && text.length > PREVIEW_CHARS,
     },
   });
 }

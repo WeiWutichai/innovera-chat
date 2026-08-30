@@ -2,6 +2,7 @@ import { fileConfig } from "@/lib/files/config";
 import { requireActiveUser, isFailure } from "@/lib/files/guard";
 import { storeFile, listOwnedFiles, usedBytes, type UploadOutcome } from "@/lib/files/service";
 import { checkUploadRateLimit } from "@/lib/rate-limiter";
+import { scheduleSweep } from "@/lib/extraction/queue";
 import { logWarn } from "@/lib/log";
 
 export const dynamic = "force-dynamic";
@@ -9,6 +10,12 @@ export const dynamic = "force-dynamic";
 export async function GET(req: Request) {
   const guard = await requireActiveUser(req);
   if (isFailure(guard)) return guard.response;
+
+  // A bounded, opportunistic sweep. This is the recovery path that needs no cron: if a
+  // restart stranded rows in PROCESSING, their leases expire and the next visit to the
+  // file list reclaims them. Not awaited, and capped by SWEEP_BATCH, so a page load
+  // never waits on extraction.
+  scheduleSweep();
 
   const cfg = fileConfig();
   const [files, used] = await Promise.all([
@@ -108,6 +115,13 @@ export async function POST(req: Request) {
   }
 
   const accepted = results.filter((r) => r.ok).length;
+
+  // Extraction runs AFTER the response, never inside it. Parsing a 25 MB spreadsheet
+  // inline would hold the request open past NGINX's patience and make upload latency a
+  // function of file complexity. Not awaited: if this process dies before the sweep
+  // finishes, the rows stay PENDING (or their leases expire) and the next sweep
+  // recovers them — losing the trigger is safe, losing the work is not.
+  if (accepted > 0) scheduleSweep();
 
   // 207 when the batch is mixed: a blanket 200 would hide per-file rejections, and a
   // blanket 400 would discard files that stored successfully.

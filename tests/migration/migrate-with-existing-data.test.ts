@@ -21,8 +21,8 @@ import { assertSafeDatabaseUrl } from "../setup/guards";
 const adminUrl = inject("adminUrl");
 const dbName = `innovera_m1_data_${randomBytes(5).toString("hex")}`;
 
-const PRE_M1_MIGRATION = "20260828104547_usage_userid_createdat_index";
 const M1_MIGRATION = "20260830120000_add_file_storage";
+const M2_MIGRATION = "20260830140000_add_file_extraction";
 
 let url: string;
 let client: PrismaClient;
@@ -65,7 +65,7 @@ beforeAll(async () => {
   );
 
   for (const name of readdirSync("prisma/migrations")) {
-    if (name === M1_MIGRATION || !name.startsWith("2026")) continue;
+    if (name === M2_MIGRATION || !name.startsWith("2026")) continue;
     mkdirSync(path.join(stagedPrisma, "migrations", name), { recursive: true });
     copyFileSync(
       path.join("prisma/migrations", name, "migration.sql"),
@@ -127,11 +127,11 @@ beforeAll(async () => {
 
   await client.$disconnect();
 
-  // 3. M1 meets the populated database.
-  mkdirSync(path.join(stagedPrisma, "migrations", M1_MIGRATION), { recursive: true });
+  // 3. The newest migration meets the populated database.
+  mkdirSync(path.join(stagedPrisma, "migrations", M2_MIGRATION), { recursive: true });
   copyFileSync(
-    path.join("prisma/migrations", M1_MIGRATION, "migration.sql"),
-    path.join(stagedPrisma, "migrations", M1_MIGRATION, "migration.sql")
+    path.join("prisma/migrations", M2_MIGRATION, "migration.sql"),
+    path.join(stagedPrisma, "migrations", M2_MIGRATION, "migration.sql")
   );
 
   execFileSync("npx", ["prisma", "migrate", "deploy", "--schema", stagedSchema], {
@@ -244,7 +244,7 @@ describe("File table shape", () => {
     expect(await client.file.count({ where: { userId: user.id } })).toBe(0);
   });
 
-  it("defaults extractStatus to SKIPPED — M1 never parses", async () => {
+  it("defaults extractStatus to PENDING so new uploads queue for extraction", async () => {
     const user = await client.user.findFirstOrThrow({ where: { clerkUserId: "ck_preexisting" } });
 
     const file = await client.file.create({
@@ -258,7 +258,7 @@ describe("File table shape", () => {
       },
     });
 
-    expect(file.extractStatus).toBe("SKIPPED");
+    expect(file.extractStatus).toBe("PENDING");
 
     await client.file.delete({ where: { id: file.id } });
   });
@@ -266,7 +266,7 @@ describe("File table shape", () => {
 
 describe("migration is non-destructive by inspection", () => {
   it("contains no DROP, TRUNCATE or DELETE", () => {
-    const sql = readFileSync(`prisma/migrations/${M1_MIGRATION}/migration.sql`, "utf8");
+    const sql = readFileSync(`prisma/migrations/${M2_MIGRATION}/migration.sql`, "utf8");
 
     expect(sql).not.toMatch(/\bDROP\b/i);
     expect(sql).not.toMatch(/\bTRUNCATE\b/i);
@@ -274,7 +274,7 @@ describe("migration is non-destructive by inspection", () => {
   });
 
   it("alters no pre-existing table", () => {
-    const sql = readFileSync(`prisma/migrations/${M1_MIGRATION}/migration.sql`, "utf8");
+    const sql = readFileSync(`prisma/migrations/${M2_MIGRATION}/migration.sql`, "utf8");
 
     // Rollback compatibility depends on this: the previous release must be able to run
     // against the migrated schema, which it can only do if its own tables are unchanged.
@@ -282,6 +282,63 @@ describe("migration is non-destructive by inspection", () => {
       expect(sql).not.toMatch(new RegExp(`ALTER TABLE "${table}"`));
     }
 
-    expect(PRE_M1_MIGRATION).toBeTruthy();
+    // The M1 migration must also remain non-destructive against this data.
+    const m1 = readFileSync(`prisma/migrations/${M1_MIGRATION}/migration.sql`, "utf8");
+    expect(m1).not.toMatch(/\bDROP\b/i);
+  });
+});
+
+describe("M1 rows are not reinterpreted by M2", () => {
+  it("leaves an existing SKIPPED row untouched", async () => {
+    // A file uploaded under M1 was stored under a contract that said its content would
+    // not be read. Silently extracting it later would change what the user sees for a
+    // file they uploaded under different rules, so SKIPPED stays SKIPPED and the
+    // extraction worker never claims it.
+    const user = await client.user.findFirstOrThrow({ where: { clerkUserId: "ck_preexisting" } });
+
+    const legacy = await client.file.create({
+      data: {
+        userId: user.id,
+        storageKey: `${user.id}/legacyblob0000000000000000000000`,
+        filename: "legacy.txt",
+        mimeType: "text/plain",
+        sizeBytes: 5,
+        checksum: "l".repeat(64),
+        extractStatus: "SKIPPED",
+      },
+    });
+
+    const claimable = await client.$queryRawUnsafe<Array<{ id: string }>>(
+      `SELECT id FROM "File"
+       WHERE "extractStatus" = 'PENDING'
+          OR ("extractStatus" = 'PROCESSING' AND "extractLeaseUntil" < now())`
+    );
+
+    expect(claimable.map((r) => r.id)).not.toContain(legacy.id);
+
+    await client.file.delete({ where: { id: legacy.id } });
+  });
+
+  it("adds the extraction columns as nullable, so existing rows need no backfill", async () => {
+    const columns = await client.$queryRawUnsafe<Array<{ column_name: string; is_nullable: string }>>(
+      `SELECT column_name, is_nullable FROM information_schema.columns
+       WHERE table_name = 'File' AND column_name LIKE 'extract%'`
+    );
+
+    const byName = Object.fromEntries(columns.map((c) => [c.column_name, c.is_nullable]));
+
+    // A NOT NULL column with no default would have failed on a populated table.
+    expect(byName.extractedText).toBe("YES");
+    expect(byName.extractedChars).toBe("YES");
+    expect(byName.extractReason).toBe("YES");
+    expect(byName.extractLeaseUntil).toBe("YES");
+  });
+
+  it("indexes the worker claim path", async () => {
+    const indexes = await client.$queryRawUnsafe<Array<{ indexdef: string }>>(
+      `SELECT indexdef FROM pg_indexes WHERE tablename = 'File'`
+    );
+
+    expect(indexes.map((i) => i.indexdef).join("\n")).toMatch(/extractStatus.*extractLeaseUntil/);
   });
 });

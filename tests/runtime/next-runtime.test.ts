@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { UpstreamServer } from "../setup/upstream";
 import {
@@ -312,5 +312,49 @@ describe("file storage code is traced into the standalone build", () => {
     expect(existsSync(path.join(standalone, "prisma"))).toBe(false);
     expect(existsSync(path.join(standalone, "@prisma/client"))).toBe(true);
     expect(existsSync(serverChunks())).toBe(true);
+  });
+});
+
+describe("extraction dependencies ship in the standalone build", () => {
+  /**
+   * output: "standalone" ships only what Next's tracer follows, and the failure mode is
+   * a container that builds cleanly and throws on the first upload. Prisma's engine
+   * already needed an explicit outputFileTracingIncludes entry for exactly this reason,
+   * so the parser dependencies get the same assertion rather than the same surprise.
+   */
+  const standalone = () => path.join(project.root, ".next/standalone/node_modules");
+
+  it("includes fflate, used for every Office format", () => {
+    expect(existsSync(path.join(standalone(), "fflate"))).toBe(true);
+  });
+
+  it("includes unpdf, used for PDF text layers", () => {
+    expect(existsSync(path.join(standalone(), "unpdf"))).toBe(true);
+  });
+
+  it("ships no native binary for either parser dependency", () => {
+    // A .node addon would tie the image to a platform and break the amd64/arm64 parity
+    // the deployment relies on.
+    for (const dep of ["fflate", "unpdf"]) {
+      const dir = path.join(standalone(), dep);
+      if (!existsSync(dir)) continue;
+
+      const native: string[] = [];
+      const walk = (d: string) => {
+        for (const entry of readdirSync(d, { withFileTypes: true })) {
+          const full = path.join(d, entry.name);
+          if (entry.isDirectory()) walk(full);
+          else if (entry.name.endsWith(".node")) native.push(full);
+        }
+      };
+      walk(dir);
+
+      expect(native).toEqual([]);
+    }
+  });
+
+  it("still ships no Prisma CLI alongside the new dependencies", () => {
+    expect(existsSync(path.join(standalone(), "prisma"))).toBe(false);
+    expect(existsSync(path.join(standalone(), "@prisma/client"))).toBe(true);
   });
 });

@@ -86,7 +86,17 @@ model Usage {
 }
 
 enum FileExtractStatus {
+  // Queued, not yet claimed.
   PENDING
+  // Claimed by a worker. Carries a lease so a crash cannot strand it here forever.
+  PROCESSING
+  // Terminal states.
+  EXTRACTED
+  PARTIAL
+  UNSUPPORTED
+  FAILED
+  // M1 legacy: uploaded before extraction existed. Never re-processed automatically, so
+  // an M1 file is never silently reinterpreted by a later milestone's parser.
   SKIPPED
 }
 
@@ -111,7 +121,29 @@ model File {
   // M1 stores and serves; it never parses. SKIPPED records that decision explicitly so
   // a later extraction milestone can find the backlog, and so the UI can state plainly
   // that content was not read rather than implying an empty result.
-  extractStatus FileExtractStatus @default(SKIPPED)
+  // New uploads queue for extraction. Files created under M1 keep SKIPPED.
+  extractStatus FileExtractStatus @default(PENDING)
+
+  // Short, classified and user-safe. Never a stack trace or a library message.
+  extractReason String?
+
+  // Bounded at write time by LIMITS.maxChars.
+  extractedText    String?
+  // Character count BEFORE truncation, so accounting stays honest.
+  extractedChars   Int?
+  extractTruncated Boolean @default(false)
+
+  // Pages / sheets / slides, and parser-reported scalars. Never file content.
+  extractUnits    Json?
+  extractMetadata Json?
+
+  extractedAt DateTime?
+
+  // Lease held by the worker currently processing this row. A row whose lease has
+  // expired is provably abandoned — the holder crashed or was restarted — and may be
+  // reclaimed. Without it, a crash mid-extraction strands a row in PROCESSING forever.
+  extractLeaseUntil DateTime?
+  extractAttempts   Int       @default(0)
 
   createdAt DateTime @default(now())
 
@@ -119,4 +151,7 @@ model File {
 
   // Serves the owner-scoped list (the only read path in M1) and the quota aggregate.
   @@index([userId, createdAt])
+  // Serves the worker's claim query: PENDING rows, or PROCESSING rows whose lease has
+  // expired. Without it that scan grows with the whole table.
+  @@index([extractStatus, extractLeaseUntil])
 }

@@ -218,6 +218,13 @@ export async function getOwnedFile(userId: string, fileId: string) {
       checksum: true,
       storageKey: true,
       extractStatus: true,
+      extractReason: true,
+      extractedText: true,
+      extractedChars: true,
+      extractTruncated: true,
+      extractUnits: true,
+      extractMetadata: true,
+      extractedAt: true,
       createdAt: true,
     },
   });
@@ -233,6 +240,9 @@ export async function listOwnedFiles(userId: string) {
       mimeType: true,
       sizeBytes: true,
       extractStatus: true,
+      extractReason: true,
+      extractedChars: true,
+      extractTruncated: true,
       createdAt: true,
     },
   });

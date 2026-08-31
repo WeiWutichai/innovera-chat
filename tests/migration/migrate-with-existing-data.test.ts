@@ -23,6 +23,7 @@ const dbName = `innovera_m1_data_${randomBytes(5).toString("hex")}`;
 
 const M1_MIGRATION = "20260830120000_add_file_storage";
 const M2_MIGRATION = "20260830140000_add_file_extraction";
+const M3_MIGRATION = "20260830160000_add_conversation_file";
 
 let url: string;
 let client: PrismaClient;
@@ -37,6 +38,16 @@ let before: {
   messageContents: string[];
   userEmail: string;
   usageTotal: number;
+};
+
+let filesCreatedByM2 = -1;
+
+/** Snapshot taken after M2 and before M3, so M3's effect is isolated. */
+let beforeM3: {
+  files: number;
+  messages: number;
+  conversations: number;
+  extractedText: string | null;
 };
 
 beforeAll(async () => {
@@ -65,7 +76,9 @@ beforeAll(async () => {
   );
 
   for (const name of readdirSync("prisma/migrations")) {
-    if (name === M2_MIGRATION || !name.startsWith("2026")) continue;
+    // Both newer migrations are held back so they can be applied IN PRODUCTION ORDER
+    // against populated data — M2 first, then M3 on top of what M2 produced.
+    if (name === M2_MIGRATION || name === M3_MIGRATION || !name.startsWith("2026")) continue;
     mkdirSync(path.join(stagedPrisma, "migrations", name), { recursive: true });
     copyFileSync(
       path.join("prisma/migrations", name, "migration.sql"),
@@ -127,7 +140,7 @@ beforeAll(async () => {
 
   await client.$disconnect();
 
-  // 3. The newest migration meets the populated database.
+  // 3. M2 meets the populated database.
   mkdirSync(path.join(stagedPrisma, "migrations", M2_MIGRATION), { recursive: true });
   copyFileSync(
     path.join("prisma/migrations", M2_MIGRATION, "migration.sql"),
@@ -139,8 +152,56 @@ beforeAll(async () => {
     stdio: "pipe",
   });
 
+  // 4. M2-shaped data: a file that has actually been extracted. M3 must preserve this
+  //    exactly, because it is what the assistant reads.
   client = new PrismaClient({ datasourceUrl: url });
-}, 180_000);
+
+  // Captured BEFORE anything is seeded, so the "M2 invents no rows" assertion still
+  // measures what M2 itself did rather than what this test set up for M3.
+  filesCreatedByM2 = await client.file.count();
+
+  const owner = await client.user.findFirstOrThrow({ where: { clerkUserId: "ck_preexisting" } });
+
+  await client.file.create({
+    data: {
+      userId: owner.id,
+      storageKey: `${owner.id}/m2extracted`,
+      filename: "quarterly.xlsx",
+      mimeType: "application/zip",
+      sizeBytes: 4096,
+      checksum: "d".repeat(64),
+      extractStatus: "PARTIAL",
+      extractedText: "REVENUE 12345 EXTRACTED UNDER M2",
+      extractedChars: 32,
+      extractTruncated: true,
+      extractReason: "some rows were dropped",
+      extractAttempts: 2,
+    },
+  });
+
+  beforeM3 = {
+    files: await client.file.count(),
+    messages: await client.message.count(),
+    conversations: await client.conversation.count(),
+    extractedText: (await client.file.findFirstOrThrow()).extractedText,
+  };
+
+  await client.$disconnect();
+
+  // 5. M3 meets a database populated by M1 and M2.
+  mkdirSync(path.join(stagedPrisma, "migrations", M3_MIGRATION), { recursive: true });
+  copyFileSync(
+    path.join("prisma/migrations", M3_MIGRATION, "migration.sql"),
+    path.join(stagedPrisma, "migrations", M3_MIGRATION, "migration.sql")
+  );
+
+  execFileSync("npx", ["prisma", "migrate", "deploy", "--schema", stagedSchema], {
+    env,
+    stdio: "pipe",
+  });
+
+  client = new PrismaClient({ datasourceUrl: url });
+}, 240_000);
 
 afterAll(async () => {
   await client?.$disconnect();
@@ -199,7 +260,8 @@ describe("M1 migration against populated data", () => {
   });
 
   it("leaves the File table empty — the migration invents no rows", async () => {
-    expect(await client.file.count()).toBe(0);
+    // Measured immediately after M2 was applied, before this suite seeded anything.
+    expect(filesCreatedByM2).toBe(0);
   });
 });
 
@@ -340,5 +402,101 @@ describe("M1 rows are not reinterpreted by M2", () => {
     );
 
     expect(indexes.map((i) => i.indexdef).join("\n")).toMatch(/extractStatus.*extractLeaseUntil/);
+  });
+});
+
+describe("M3 migration against a database populated by M1 and M2", () => {
+  it("applies cleanly with every migration recorded in order", () => {
+    const status = execFileSync(
+      "npx",
+      ["prisma", "migrate", "status", "--schema", path.join(stage, "prisma", "schema.prisma")],
+      { env: { ...process.env, DATABASE_URL: url }, encoding: "utf8" }
+    );
+
+    expect(status).toContain("Database schema is up to date!");
+  });
+
+  it("creates the ConversationFile table", async () => {
+    const tables = await client.$queryRawUnsafe<{ tablename: string }[]>(
+      `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`
+    );
+
+    expect(tables.map((t) => t.tablename)).toContain("ConversationFile");
+  });
+
+  it("invents no attachments", async () => {
+    // A migration that guessed which files belonged to which conversation would put
+    // content into prompts nobody asked for.
+    expect(await client.conversationFile.count()).toBe(0);
+  });
+
+  it("preserves every M1 and M2 row", async () => {
+    expect(await client.file.count()).toBe(beforeM3.files);
+    expect(await client.message.count()).toBe(beforeM3.messages);
+    expect(await client.conversation.count()).toBe(beforeM3.conversations);
+  });
+
+  it("preserves extracted text and its extraction fields verbatim", async () => {
+    const file = await client.file.findFirstOrThrow();
+
+    expect(file.extractedText).toBe(beforeM3.extractedText);
+    expect(file.extractStatus).toBe("PARTIAL");
+    expect(file.extractTruncated).toBe(true);
+    expect(file.extractAttempts).toBe(2);
+    expect(file.extractReason).toBe("some rows were dropped");
+  });
+
+  it("enforces composite uniqueness so attaching twice cannot duplicate", async () => {
+    const conversation = await client.conversation.findFirstOrThrow();
+    const file = await client.file.findFirstOrThrow();
+
+    await client.conversationFile.create({
+      data: { conversationId: conversation.id, fileId: file.id },
+    });
+
+    await expect(
+      client.conversationFile.create({
+        data: { conversationId: conversation.id, fileId: file.id },
+      })
+    ).rejects.toThrow();
+
+    await client.conversationFile.deleteMany({});
+  });
+
+  it("cascades from Conversation without touching the File", async () => {
+    // Captured BEFORE anything is seeded, so the "M2 invents no rows" assertion still
+  // measures what M2 itself did rather than what this test set up for M3.
+  filesCreatedByM2 = await client.file.count();
+
+  const owner = await client.user.findFirstOrThrow({ where: { clerkUserId: "ck_preexisting" } });
+    const file = await client.file.findFirstOrThrow();
+
+    const doomed = await client.conversation.create({
+      data: { userId: owner.id, title: "temporary" },
+    });
+
+    await client.conversationFile.create({
+      data: { conversationId: doomed.id, fileId: file.id },
+    });
+
+    await client.conversation.delete({ where: { id: doomed.id } });
+
+    expect(await client.conversationFile.count()).toBe(0);
+    // The file — and its extracted text — survives losing a conversation.
+    expect(await client.file.findUnique({ where: { id: file.id } })).not.toBeNull();
+  });
+
+  it("is non-destructive by inspection", () => {
+    const sql = readFileSync(`prisma/migrations/${M3_MIGRATION}/migration.sql`, "utf8");
+
+    expect(sql).not.toMatch(/\bDROP\b/i);
+    expect(sql).not.toMatch(/\bTRUNCATE\b/i);
+    expect(sql).not.toMatch(/\bDELETE\s+FROM\b/i);
+
+    // Rollback compatibility: the previous release must still run against this schema,
+    // which it can only do if none of its own tables changed.
+    for (const table of ["User", "Conversation", "Message", "Usage", "File"]) {
+      expect(sql).not.toMatch(new RegExp(`ALTER TABLE "${table}"`));
+    }
   });
 });

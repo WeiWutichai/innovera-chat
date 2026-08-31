@@ -47,8 +47,9 @@ model Conversation {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages Message[]
+  files    ConversationFile[]
 
   @@index([userId])
 }
@@ -147,11 +148,47 @@ model File {
 
   createdAt DateTime @default(now())
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversations ConversationFile[]
 
   // Serves the owner-scoped list (the only read path in M1) and the quota aggregate.
   @@index([userId, createdAt])
   // Serves the worker's claim query: PENDING rows, or PROCESSING rows whose lease has
   // expired. Without it that scan grows with the whole table.
   @@index([extractStatus, extractLeaseUntil])
+}
+
+/**
+ * Attaches an already-uploaded File to a Conversation.
+ * A JOIN ROW ONLY — it carries no content and no copy of the blob. The same File may be
+ * attached to several conversations, which is the point: re-asking about a document must
+ * not mean re-uploading it, and must not consume the storage quota twice.
+ * OWNERSHIP IS NOT EXPRESSED HERE, AND THAT IS DELIBERATE.
+ * There is no userId column. A join row that carried its own userId could disagree with
+ * the two rows it points at, and the disagreement would be invisible. Instead both sides
+ * are re-checked against the authenticated user on every write (see
+ * src/lib/ai/context/attachments.ts) — the database enforces existence and uniqueness,
+ * the service enforces ownership.
+ * LIFECYCLE
+ * detach a file from a conversation -> this row is deleted, the File is untouched
+ * delete the Conversation           -> cascade removes its rows, Files are untouched
+ * delete the File                   -> cascade removes its rows, Conversations and
+ * their Messages are untouched
+ * Cascade rather than service logic for the two deletes: the join row is meaningless
+ * without either endpoint, so a dangling row is never the correct outcome, and enforcing
+ * that in the schema means it holds for restores and manual SQL too.
+ */
+model ConversationFile {
+  conversationId String
+  fileId         String
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  file         File         @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  // Composite primary key IS the uniqueness constraint: attaching the same file twice
+  // is idempotent rather than an error, and no surrogate id can drift from it.
+  @@id([conversationId, fileId])
+  // Serves the reverse lookup used when a File is deleted or listed.
+  @@index([fileId])
 }

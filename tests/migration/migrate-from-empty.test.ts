@@ -60,6 +60,7 @@ describe("migrating from an empty database", () => {
       "20260828104547_usage_userid_createdat_index",
       "20260830120000_add_file_storage",
       "20260830140000_add_file_extraction",
+      "20260830160000_add_conversation_file",
     ]);
   });
 
@@ -114,8 +115,12 @@ describe("referential integrity", () => {
       ORDER BY tc.table_name
     `);
 
-    // Four now: User<-Conversation, Conversation<-Message, User<-Usage, User<-File.
-    expect(rules).toHaveLength(4);
+    // Six now. The two added by M3 are what make detaching safe in both directions:
+    //   User<-Conversation, Conversation<-Message, User<-Usage, User<-File,
+    //   Conversation<-ConversationFile, File<-ConversationFile.
+    // Deleting a conversation or a file removes only the JOIN rows; the other endpoint
+    // and its messages survive.
+    expect(rules).toHaveLength(6);
     for (const rule of rules) expect(rule.delete_rule).toBe("CASCADE");
   });
 

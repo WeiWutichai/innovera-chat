@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { STATUS_TEXT } from "@/lib/files/status";
 
 type StoredFile = {
   id: string;
@@ -26,15 +27,8 @@ type FileDetail = StoredFile & {
  * Every state a user can see, phrased so the difference between "nothing to read" and
  * "we could not read it" is never ambiguous.
  */
-const STATUS_TEXT: Record<string, { label: string; tone: string; hint: string }> = {
-  PENDING: { label: "รอประมวลผล", tone: "text-white/40", hint: "กำลังรอคิวอ่านเนื้อหา" },
-  PROCESSING: { label: "กำลังอ่าน", tone: "text-sky-300", hint: "กำลังอ่านเนื้อหาไฟล์" },
-  EXTRACTED: { label: "อ่านแล้ว", tone: "text-emerald-300", hint: "อ่านเนื้อหาได้ครบถ้วน" },
-  PARTIAL: { label: "อ่านบางส่วน", tone: "text-amber-300", hint: "อ่านได้บางส่วนเท่านั้น" },
-  UNSUPPORTED: { label: "ไม่รองรับ", tone: "text-white/40", hint: "เก็บและดาวน์โหลดได้ แต่อ่านเนื้อหาไม่ได้" },
-  FAILED: { label: "อ่านไม่สำเร็จ", tone: "text-red-300", hint: "ไม่สามารถอ่านเนื้อหาไฟล์นี้ได้" },
-  SKIPPED: { label: "ไม่ได้อ่าน", tone: "text-white/40", hint: "อัปโหลดก่อนระบบอ่านไฟล์จะเปิดใช้งาน" },
-};
+// STATUS_TEXT now lives in @/lib/files/status so the chat composer shows the same
+// labels for the same file. Imported above.
 
 type Quota = { usedBytes: number; limitBytes: number };
 

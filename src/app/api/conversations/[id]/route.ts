@@ -36,6 +36,26 @@ export async function GET(
           createdAt: true,
         },
       },
+      // Attachments travel with the conversation so reopening it restores the composer's
+      // chips without a second round trip. Metadata only — extractedText is never
+      // selected here, so file content has no path to the browser through this endpoint.
+      files: {
+        orderBy: [{ createdAt: "asc" }, { fileId: "asc" }],
+        select: {
+          file: {
+            select: {
+              id: true,
+              filename: true,
+              mimeType: true,
+              sizeBytes: true,
+              extractStatus: true,
+              extractReason: true,
+              extractTruncated: true,
+              createdAt: true,
+            },
+          },
+        },
+      },
     },
   });
 
@@ -46,5 +66,10 @@ export async function GET(
     );
   }
 
-  return Response.json({ conversation });
+  // Flattened so the client sees a list of files rather than a list of join rows.
+  const { files, ...rest } = conversation;
+
+  return Response.json({
+    conversation: { ...rest, attachments: files.map((f) => f.file) },
+  });
 }

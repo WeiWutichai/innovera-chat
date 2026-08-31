@@ -27,7 +27,24 @@ function code(relative: string) {
     .join("\n");
 }
 
-const chat = code("src/components/chat-interface.tsx");
+/**
+ * The chat UI is split across several components (M3), so the class contract these tests
+ * guard is now spread over several files. They are concatenated in LAYOUT ORDER — shell,
+ * sidebar, message list, composer, picker — so `indexOf`-based slicing below still finds
+ * the right element, and every assertion keeps the exact meaning it had when the markup
+ * lived in one file.
+ */
+const CHAT_SOURCES = [
+  "src/components/chat/chat-interface.tsx",
+  "src/components/chat/chat-header.tsx",
+  "src/components/chat/conversation-sidebar.tsx",
+  "src/components/chat/message-list.tsx",
+  "src/components/chat/composer.tsx",
+  "src/components/chat/attachment-chips.tsx",
+  "src/components/chat/attachment-picker.tsx",
+];
+
+const chat = CHAT_SOURCES.map(code).join("\n");
 const layout = code("src/app/layout.tsx");
 const admin = code("src/app/admin/page.tsx");
 
@@ -81,6 +98,12 @@ describe("mobile sidebar / drawer", () => {
     expect(open.slice(0, 500)).toContain("setSidebarOpen(false)");
     const fresh = chat.slice(chat.indexOf("function newChat"));
     expect(fresh.slice(0, 300)).toContain("setSidebarOpen(false)");
+  });
+
+  it("hands the drawer its state and close handler rather than duplicating them", () => {
+    // The decomposition must not fork drawer state: one owner, passed down.
+    expect(chat).toContain("sidebarOpen={sidebarOpen}");
+    expect(chat).toContain("onClose={() => setSidebarOpen(false)}");
   });
 });
 
@@ -150,8 +173,16 @@ describe("viewport sizing", () => {
 
   it("has exactly one scroll container for the conversation", () => {
     const overflowY = chat.match(/overflow-y-auto/g) ?? [];
-    // conversation area, history list, and the textarea — no nested duplicate.
-    expect(overflowY.length).toBe(3);
+    // A full inventory, so a new one cannot appear unnoticed:
+    //   1. the conversation area          (chat-interface)
+    //   2. the chat history list          (conversation-sidebar)
+    //   3. the textarea                   (composer)
+    //   4. the file list in the picker    (attachment-picker, M3)
+    // The conversation itself still scrolls in exactly one place — no nested duplicate.
+    expect(overflowY.length).toBe(4);
+
+    const shell = code("src/components/chat/chat-interface.tsx");
+    expect((shell.match(/overflow-y-auto/g) ?? []).length).toBe(1);
   });
 });
 

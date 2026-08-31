@@ -8,7 +8,7 @@ import {
   createSlotRelease,
 } from "@/lib/rate-limiter";
 import { checkDailyQuota } from "@/lib/usage-quota";
-import { selectContextWithinBudget } from "@/lib/context-window";
+import { buildChatContext } from "@/lib/ai/context/builder";
 import { logInfo, logWarn, logError } from "@/lib/log";
 
 // conversationId is bounded so an oversized value is rejected with a 400 before any
@@ -16,9 +16,19 @@ import { logInfo, logWarn, logError } from "@/lib/log";
 // multi-megabyte string being carried into a query. Real ids are cuid-shaped (~25 chars).
 const CONVERSATION_ID_MAX_LENGTH = 64;
 
+// File ids are accepted from the client but are NEVER trusted. Every id is
+// re-authorized server-side against the signed-in user inside buildChatContext, so a
+// forged id can only ever produce a 404 — the client's view of what is attached has no
+// authority over what is read.
+const MAX_REQUEST_FILE_IDS = 20;
+
 const chatRequestSchema = z.object({
   message: z.string().trim().min(1).max(chatConfig.maxMessageLength),
   conversationId: z.string().max(CONVERSATION_ID_MAX_LENGTH).nullish(),
+  fileIds: z
+    .array(z.string().min(1).max(CONVERSATION_ID_MAX_LENGTH))
+    .max(MAX_REQUEST_FILE_IDS)
+    .optional(),
 });
 
 type ChatCompletion = {
@@ -51,6 +61,9 @@ const TOO_MANY_IN_FLIGHT =
 const QUOTA_EXCEEDED =
   "คุณใช้โควตาโทเค็นประจำวันครบแล้ว กรุณาลองใหม่ในวันถัดไป";
 const REQUEST_CANCELLED = "ยกเลิกคำขอแล้ว";
+const FILE_NOT_FOUND = "ไม่พบไฟล์ที่แนบ หรือคุณไม่มีสิทธิ์เข้าถึงไฟล์นี้";
+const CONTEXT_TOO_LARGE =
+  "เนื้อหาที่แนบมีขนาดใหญ่เกินไป กรุณาลดจำนวนไฟล์แล้วลองใหม่";
 
 function messageForUpstreamStatus(status: number) {
   return status === 429 ? UPSTREAM_BUSY : UPSTREAM_UNAVAILABLE;
@@ -389,20 +402,42 @@ export async function POST(req: Request) {
 
     recentMessages.reverse();
 
-    const { selected, usedChars } = selectContextWithinBudget(
-      recentMessages,
-      chatConfig.contextCharBudget
-    );
+    // The ONE integration point for file context. Ownership and eligibility are both
+    // settled inside this call, before any extracted text is placed into a prompt, and
+    // the assembled result is guaranteed to fit chatConfig.contextCharBudget.
+    const context = await buildChatContext({
+      userId: appUser.id,
+      conversationId,
+      currentMessage: message,
+      requestedFileIds: parsed.data.fileIds ?? [],
+      history: recentMessages,
+      budget: chatConfig.contextCharBudget,
+    });
 
-    const aiMessages = selected.map((m) => ({
-      role:
-        m.role === "USER"
-          ? "user"
-          : m.role === "ASSISTANT"
-            ? "assistant"
-            : "system",
-      content: m.content,
-    }));
+    if (!context.ok) {
+      // Both failures happen BEFORE the upstream call, so no GPU time is spent and no
+      // usage is recorded. The turn is undone by the same path an upstream failure uses,
+      // so a retry does not stack two consecutive user messages.
+      await rollbackTurn();
+
+      if (context.reason === "forbidden_file") {
+        logWarn("chat.attachment_rejected", {
+          correlationId,
+          userId: appUser.id,
+          requested: parsed.data.fileIds?.length ?? 0,
+        });
+
+        return failure(404, FILE_NOT_FOUND, "file_not_found");
+      }
+
+      // Reached only when even the smallest safe assembly is still over the limit, so
+      // no upstream call is made and no usage is recorded.
+      logWarn("chat.context_too_large", { correlationId, userId: appUser.id });
+
+      return failure(400, CONTEXT_TOO_LARGE, "context_too_large");
+    }
+
+    const aiMessages = context.messages;
 
     // Two independent abort sources, combined: the application's own generation
     // deadline, and the client going away. `AbortSignal.any` propagates whichever
@@ -561,10 +596,16 @@ export async function POST(req: Request) {
     // The turn is committed; nothing after this point may undo it.
     rollbackTurn = null;
 
+    // Scalars only. Never a filename, never extracted text, never file content.
     logInfo("chat.completed", {
         correlationId,
         contextMessages: aiMessages.length,
-        contextChars: usedChars,
+        contextChars: context.stats.totalChars,
+        fileContextChars: context.stats.fileChars,
+        activeFiles: context.stats.activeFiles,
+        filesWithContent: context.stats.filesWithContent,
+        estimatedTokens: context.stats.estimatedTokens,
+        shrunkForTokens: context.stats.shrunkForTokens,
         totalTokens: usage.total_tokens ?? null,
       });
 

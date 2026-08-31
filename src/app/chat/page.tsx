@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getCurrentAppUser } from "@/lib/current-app-user";
-import ChatInterface from "@/components/chat-interface";
+import ChatInterface from "@/components/chat/chat-interface";
 
 export default async function ChatPage() {
   const user = await getCurrentAppUser();

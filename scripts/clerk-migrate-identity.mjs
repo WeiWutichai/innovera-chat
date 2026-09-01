@@ -29,16 +29,67 @@
  * cannot tell a development id from a production one — they are shaped identically — and
  * it never contacts Clerk to find out.
  *
+ *   Supply the target id from a file instead of the command line:
+ *     node scripts/clerk-migrate-identity.mjs --email owner@example.com \
+ *       --clerk-user-id-file /path/to/id --confirm-user-id <User.id> --apply
+ *
+ * --clerk-user-id-file exists so the target identity never has to appear on the command
+ * line (where `ps` and shell history can see it), in .env.local, or in a chat transcript.
+ * It is mutually exclusive with --clerk-user-id.
+ *
+ * RUNTIME: plain ESM, no TypeScript, no flags. It runs on any Node >= 18. An earlier
+ * revision imported a .ts module through a .js specifier, which no Node runtime resolves;
+ * the CLI could not start at all. See scripts/lib/clerk-identity-migration.mjs.
+ *
  * DATABASE_URL must be set. No key, token or session value is read, printed or written by
- * this tool; email addresses appear masked.
+ * this tool; email addresses appear masked and the target id is never printed in full.
  */
+
+/** Never emit a target id in full — not in output, not in an error. */
+function maskId(id) {
+  return typeof id === "string" && id.length > 8 ? `${id.slice(0, 8)}\u2026` : "\u2026";
+}
+
+/**
+ * Reads exactly one Clerk user id from a file.
+ *
+ * Returns { id } or { error } — and the error NEVER contains the file's contents, so a
+ * malformed file cannot leak the value it holds into a terminal or a ticket.
+ */
+function readClerkIdFile(path) {
+  let raw;
+
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return { error: `cannot read --clerk-user-id-file at the given path` };
+  }
+
+  // Only CR/LF are stripped. A value carrying stray spaces stays invalid rather than
+  // being silently repaired into something that passes validation.
+  const lines = raw.split(/\r?\n/).map((l) => l.replace(/^[\r\n]+|[\r\n]+$/g, ""));
+  const values = lines.filter((l) => l.length > 0);
+
+  if (values.length === 0) return { error: "--clerk-user-id-file is empty" };
+  if (values.length > 1) {
+    return { error: `--clerk-user-id-file contains ${values.length} non-empty lines; expected exactly 1` };
+  }
+
+  if (!isValidClerkUserId(values[0])) {
+    return { error: "--clerk-user-id-file does not contain a valid Clerk user id" };
+  }
+
+  return { id: values[0] };
+}
+import { readFileSync } from "node:fs";
 import { PrismaClient } from "@prisma/client";
 import {
   planMigration,
   applyMigration,
   surveyPrivilegedAccounts,
   maskEmail,
-} from "../src/lib/admin/clerk-identity-migration.js";
+  isValidClerkUserId,
+} from "./lib/clerk-identity-migration.mjs";
 
 function arg(name) {
   const i = process.argv.indexOf(`--${name}`);
@@ -50,8 +101,10 @@ const has = (name) => process.argv.includes(`--${name}`);
 function usage() {
   console.error("usage:");
   console.error("  --survey");
-  console.error("  --email <address> --clerk-user-id <user_...> [--case-insensitive]");
-  console.error("  --email <address> --clerk-user-id <user_...> --confirm-user-id <User.id> --apply");
+  console.error("  --email <address> (--clerk-user-id <user_...> | --clerk-user-id-file <path>) [--case-insensitive]");
+  console.error("  --email <address> (--clerk-user-id <user_...> | --clerk-user-id-file <path>) --confirm-user-id <User.id> --apply");
+  console.error("");
+  console.error("  --clerk-user-id and --clerk-user-id-file are mutually exclusive.");
 }
 
 async function main() {
@@ -82,7 +135,28 @@ async function main() {
     }
 
     const email = arg("email");
-    const clerkUserId = arg("clerk-user-id");
+    const inlineId = arg("clerk-user-id");
+    const idFile = arg("clerk-user-id-file");
+
+    if (inlineId && idFile) {
+      console.error("REFUSED: --clerk-user-id and --clerk-user-id-file are mutually exclusive.");
+      usage();
+      return 2;
+    }
+
+    let clerkUserId = inlineId;
+
+    if (idFile) {
+      const read = readClerkIdFile(idFile);
+
+      if (read.error) {
+        // The message names the problem, never the value.
+        console.error(`REFUSED: ${read.error}`);
+        return 1;
+      }
+
+      clerkUserId = read.id;
+    }
 
     if (!email || !clerkUserId) {
       usage();
@@ -116,7 +190,7 @@ async function main() {
 
       case "already_bound":
         console.log(
-          `ALREADY BOUND — ${maskEmail(result.matchedEmail)} (User.id=${result.userId}) is already bound to ${result.nextClerkUserId}. Nothing to do.`
+          `ALREADY BOUND — ${maskEmail(result.matchedEmail)} (User.id=${result.userId}) is already bound to ${maskId(result.nextClerkUserId)}. Nothing to do.`
         );
         return 0;
 
@@ -126,8 +200,8 @@ async function main() {
         console.log(`  User.id      ${result.userId}`);
         console.log(`  role         ${result.role}      (unchanged by this migration)`);
         console.log(`  status       ${result.userStatus}      (unchanged by this migration)`);
-        console.log(`  clerkUserId  ${result.previousClerkUserId}`);
-        console.log(`            -> ${result.nextClerkUserId}`);
+        console.log(`  clerkUserId  ${maskId(result.previousClerkUserId)}`);
+        console.log(`            -> ${maskId(result.nextClerkUserId)}`);
         console.log("\n  To apply, re-run with:");
         console.log(`    --confirm-user-id ${result.userId} --apply`);
         return 0;
@@ -138,13 +212,23 @@ async function main() {
         console.log(`  User.id      ${result.userId}      (verified unchanged)`);
         console.log(`  role         ${result.role}      (verified unchanged)`);
         console.log(`  status       ${result.userStatus}      (verified unchanged)`);
-        console.log(`  clerkUserId  ${result.rollback.previousClerkUserId}`);
-        console.log(`            -> ${result.rollback.targetClerkUserId}`);
+        console.log(`  clerkUserId  ${maskId(result.rollback.previousClerkUserId)}`);
+        console.log(`            -> ${maskId(result.rollback.targetClerkUserId)}`);
+        // ROLLBACK INSTRUCTION.
+        //
+        // The PREVIOUS id is printed in full, deliberately and as the sole exception.
+        // Only this tool ever learns it: it is read from the database and immediately
+        // overwritten, so masking it would make the migration irreversible. It is the
+        // superseded DEVELOPMENT identity, not the production one being introduced.
+        //
+        // The TARGET id stays masked — the operator supplied it and already holds it,
+        // so printing it back would put the production identity into terminal
+        // scrollback and pasted tickets for no operational gain.
         console.log("\n  ROLLBACK INSTRUCTION — record this now:");
         console.log(`    User.id              ${result.rollback.userId}`);
-        console.log(`    previous clerkUserId ${result.rollback.previousClerkUserId}`);
-        console.log(`    target   clerkUserId ${result.rollback.targetClerkUserId}`);
-        console.log(`    command              ${result.rollback.command}`);
+        console.log(`    previous clerkUserId ${result.rollback.previousClerkUserId}   <- needed to reverse`);
+        console.log(`    target   clerkUserId ${maskId(result.rollback.targetClerkUserId)}`);
+        console.log(`    reverse with         --clerk-user-id ${result.rollback.previousClerkUserId} --confirm-user-id ${result.rollback.userId} --apply`);
         return 0;
 
       default:

@@ -7,7 +7,7 @@ import {
   surveyPrivilegedAccounts,
   maskEmail,
   isValidClerkUserId,
-} from "@/lib/admin/clerk-identity-migration";
+} from "../../scripts/lib/clerk-identity-migration.mjs";
 
 /**
  * The controlled Clerk instance cutover.
@@ -331,11 +331,12 @@ describe("normal collision recovery is NOT weakened", () => {
   it("is not reachable from any route", async () => {
     const { execSync } = await import("node:child_process");
     const hits = execSync(
-      "grep -rl 'clerk-identity-migration' src/app 2>/dev/null || true",
+      "grep -rl 'clerk-identity-migration' src/ 2>/dev/null || true",
       { encoding: "utf8" }
     ).trim();
 
-    // A migration tool importable from a request handler would be an takeover endpoint.
+    // A migration tool importable from application code would be a takeover endpoint.
+    // It now lives under scripts/ precisely so it cannot be bundled into the app.
     expect(hits).toBe("");
   });
 });
@@ -492,7 +493,7 @@ describe("the last ACTIVE ADMIN cannot be damaged", () => {
 
   it("verifies the admin count inside the transaction, not merely afterwards", async () => {
     const { readFileSync } = await import("node:fs");
-    const source = readFileSync("src/lib/admin/clerk-identity-migration.ts", "utf8");
+    const source = readFileSync("scripts/lib/clerk-identity-migration.mjs", "utf8");
     const tx = source.slice(source.indexOf("db.$transaction"));
 
     // Both counts and every verification must sit inside the transaction, or a failure
@@ -580,7 +581,7 @@ describe("no secret material appears in any output", () => {
 
   it("never reads a Clerk key from the environment", async () => {
     const { readFileSync } = await import("node:fs");
-    const toolSource = readFileSync("src/lib/admin/clerk-identity-migration.ts", "utf8");
+    const toolSource = readFileSync("scripts/lib/clerk-identity-migration.mjs", "utf8");
     const cli = readFileSync("scripts/clerk-migrate-identity.mjs", "utf8");
 
     for (const source of [toolSource, cli]) {

@@ -1,7 +1,17 @@
-import type { PrismaClient } from "@prisma/client";
-
 /**
  * Controlled Clerk identity migration.
+ *
+ * ============================ WHY THIS IS PLAIN JAVASCRIPT ======================
+ * This module is loaded by an OPERATOR CLI during a production cutover, not by the
+ * application. It was previously TypeScript, and that made the CLI unrunnable: Node does
+ * not resolve a `.js` import specifier to a `.ts` file, and stripping types needs Node 22
+ * plus `--experimental-strip-types`. The defect survived review because the test suite
+ * imported the MODULE through Vitest (which resolves TypeScript natively) and never
+ * executed the CLI wrapper.
+ *
+ * Plain ESM removes the whole class of problem: it runs on any Node >= 18, needs no
+ * flags, and can be exercised by a test that spawns the real CLI. Behaviour is unchanged
+ * and is pinned by the same 48 tests; JSDoc carries the shapes the types used to.
  *
  * ============================== WHY THIS EXISTS =================================
  * Switching Clerk from the development instance to the production instance gives every
@@ -41,64 +51,6 @@ import type { PrismaClient } from "@prisma/client";
  * =================================================================================
  */
 
-export type RefusalReason =
-  | "invalid_clerk_user_id"
-  | "email_not_found"
-  | "ambiguous_email"
-  | "clerk_id_belongs_to_another_user"
-  | "missing_target_confirmation"
-  | "target_confirmation_mismatch"
-  | "would_remove_last_active_admin"
-  | "verification_failed";
-
-/**
- * What to run to undo a migration. Deliberately a value the tool RETURNS rather than
- * something scraped from console history, and deliberately not a database table — a
- * one-time cutover does not warrant its own schema.
- *
- * Contains identifiers only. No key, no token, no address.
- */
-export type RollbackPlan = {
-  userId: string;
-  previousClerkUserId: string;
-  targetClerkUserId: string;
-  command: string;
-};
-
-export type MigrationOutcome =
-  | {
-      status: "would_change";
-      userId: string;
-      previousClerkUserId: string;
-      nextClerkUserId: string;
-      matchedEmail: string;
-      role: string;
-      userStatus: string;
-    }
-  | {
-      status: "changed";
-      userId: string;
-      previousClerkUserId: string;
-      nextClerkUserId: string;
-      matchedEmail: string;
-      role: string;
-      userStatus: string;
-      rollback: RollbackPlan;
-    }
-  | { status: "already_bound"; userId: string; nextClerkUserId: string; matchedEmail: string }
-  | { status: "refused"; reason: RefusalReason; detail: string };
-
-export type MigrationInput = {
-  email: string;
-  clerkUserId: string;
-  /** Default false: match the address byte for byte. */
-  caseInsensitive?: boolean;
-  /**
-   * The `User.id` the operator saw in the dry run. `applyMigration` REQUIRES it and
-   * refuses unless it matches the row the email resolves to now.
-   */
-  expectedUserId?: string;
-};
 
 /**
  * Conservative shape check for a Clerk user id.
@@ -113,12 +65,12 @@ export type MigrationInput = {
 const CLERK_USER_ID = /^user_[A-Za-z0-9]{16,64}$/;
 const CLERK_USER_ID_MAX_LENGTH = 80;
 
-export function isValidClerkUserId(value: string): boolean {
+export function isValidClerkUserId(value) {
   return value.length <= CLERK_USER_ID_MAX_LENGTH && CLERK_USER_ID.test(value);
 }
 
 /** Masks an address for output. Migration runs are logged, and addresses are personal data. */
-export function maskEmail(email: string): string {
+export function maskEmail(email) {
   const at = email.indexOf("@");
   if (at <= 0) return "***";
 
@@ -128,7 +80,7 @@ export function maskEmail(email: string): string {
   return `${local.slice(0, 1)}${"*".repeat(Math.max(2, local.length - 1))}${domain}`;
 }
 
-function rollbackFor(userId: string, previous: string, target: string): RollbackPlan {
+function rollbackFor(userId, previous, target) {
   return {
     userId,
     previousClerkUserId: previous,
@@ -139,18 +91,14 @@ function rollbackFor(userId: string, previous: string, target: string): Rollback
   };
 }
 
-async function findByEmail(
-  db: PrismaClient,
-  email: string,
-  caseInsensitive: boolean
-) {
+async function findByEmail(db, email, caseInsensitive) {
   const select = {
     id: true,
     email: true,
     clerkUserId: true,
     role: true,
     status: true,
-  } as const;
+  };
 
   if (!caseInsensitive) {
     const row = await db.user.findUnique({ where: { email }, select });
@@ -170,10 +118,7 @@ async function findByEmail(
  * The dry run and the real run share this function, so a plan that reports `would_change`
  * cannot be followed by an apply that does something different.
  */
-export async function planMigration(
-  db: PrismaClient,
-  input: MigrationInput
-): Promise<MigrationOutcome> {
+export async function planMigration(db, input) {
   if (!isValidClerkUserId(input.clerkUserId)) {
     return {
       status: "refused",
@@ -259,10 +204,7 @@ export async function planMigration(
  * Everything below happens inside that transaction, and any mismatch throws — so the
  * write is rolled back and the row is left exactly as it was.
  */
-export async function applyMigration(
-  db: PrismaClient,
-  input: MigrationInput
-): Promise<MigrationOutcome> {
+export async function applyMigration(db, input) {
   // Required for apply, optional for plan: the operator must echo back the User.id the
   // dry run showed them, so an apply cannot land on a row they never inspected.
   if (!input.expectedUserId) {
@@ -277,7 +219,7 @@ export async function applyMigration(
   try {
     return await db.$transaction(
       async (tx) => {
-        const client = tx as unknown as PrismaClient;
+        const client = tx;
 
         // 1. Resolve, validate and confirm the target — inside the transaction.
         const plan = await planMigration(client, input);
@@ -326,7 +268,7 @@ export async function applyMigration(
         }
 
         return {
-          status: "changed" as const,
+          status: "changed",
           userId: plan.userId,
           previousClerkUserId: before.clerkUserId,
           nextClerkUserId: input.clerkUserId,
@@ -352,7 +294,7 @@ export async function applyMigration(
 }
 
 /** Read-only survey: who must be pre-bound before the cutover. Addresses are masked. */
-export async function surveyPrivilegedAccounts(db: PrismaClient) {
+export async function surveyPrivilegedAccounts(db) {
   const rows = await db.user.findMany({
     where: { OR: [{ role: "ADMIN" }, { status: "ACTIVE" }] },
     select: { id: true, email: true, role: true, status: true, clerkUserId: true },
